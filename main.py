@@ -9,8 +9,19 @@ import base64
 app = FastAPI()
 
 # ================= LOAD MODELS =================
-nafld_model = tf.keras.models.load_model("/content/drive/MyDrive/nafld_model.h5")
-unet_model = tf.keras.models.load_model("/content/drive/MyDrive/liver_unet.keras", compile=False)
+import os
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+nafld_model = tf.keras.models.load_model(
+    os.path.join(BASE_DIR, "nafld_model.h5"),
+    compile=False
+)
+
+unet_model = tf.keras.models.load_model(
+    os.path.join(BASE_DIR, "liver_unet.keras"),
+    compile=False
+)
 
 # ================= HELPERS =================
 def preprocess_for_cnn(image):
