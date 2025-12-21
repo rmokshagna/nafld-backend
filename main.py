@@ -60,58 +60,68 @@ def encode_image(img):
 # ================= API =================
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    contents = await file.read()
-    image = np.array(Image.open(io.BytesIO(contents)).convert("RGB"))
+    try:
+        contents = await file.read()
+        image = np.array(Image.open(io.BytesIO(contents)).convert("RGB"))
 
-    # ---------- CNN CLASSIFICATION ----------
-    cnn_input = preprocess_for_cnn(image)
-    prob = float(nafld_model.predict(cnn_input)[0][0])
+        # ---------- CNN ----------
+        cnn_input = preprocess_for_cnn(image)
+        prob = float(nafld_model.predict(cnn_input)[0][0])
 
-    # ---------- HEALTHY ----------
-    if prob < 0.5:
-        return {
-            "Diagnosis": "Healthy Liver",
-            "Probability": round(prob, 3),
-            "Stage": "Normal Liver"
-        }
+        # ---------- HEALTHY ----------
+        if prob < 0.5:
+            return {
+                "Diagnosis": "Healthy Liver",
+                "Probability": round(prob, 3),
+                "Stage": "Normal Liver"
+            }
 
-    # ---------- NAFLD ----------
-    mask = segment_liver(image)
+        # ---------- NAFLD ----------
+        # Step 1: Segmentation
+        mask_256 = segment_liver(image)
 
-    # Resize mask to original size
-    mask_resized = cv2.resize(
-        mask,
-        (image.shape[1], image.shape[0]),
-        interpolation=cv2.INTER_NEAREST
-    )
+        # Step 2: Resize mask
+        mask = cv2.resize(
+            mask_256,
+            (image.shape[1], image.shape[0]),
+            interpolation=cv2.INTER_NEAREST
+        )
 
-    mean_hu = compute_mean_hu(image, mask_resized)
+        # Step 3: HU
+        mean_hu = compute_mean_hu(image, mask)
 
-    # ---------- SAFE FALLBACK ----------
-    if mean_hu is None:
+        if mean_hu is None:
+            return {
+                "Diagnosis": "NAFLD",
+                "Probability": round(prob, 3),
+                "Stage": "Segmentation Failed (Empty Liver Mask)"
+            }
+
+        stage = nafld_stage(mean_hu)
+
+        # Step 4: ROI
+        roi = image.copy()
+        roi[mask == 0] = 0
+
+        # Step 5: Heatmap
+        heatmap = cv2.applyColorMap(
+            (mask * 255).astype(np.uint8),
+            cv2.COLORMAP_JET
+        )
+        heatmap = cv2.addWeighted(image, 0.6, heatmap, 0.4, 0)
+
         return {
             "Diagnosis": "NAFLD",
             "Probability": round(prob, 3),
-            "Stage": "NAFLD (Segmentation Failed)",
-            "Note": "Liver segmentation failed for this image"
+            "Mean_HU": round(mean_hu, 2),
+            "Stage": stage,
+            "ROI_Image": encode_image(roi),
+            "Heatmap_Image": encode_image(heatmap),
+            "Segmentation_Mask": encode_image(mask * 255)
         }
 
-    stage = nafld_stage(mean_hu)
-
-    # ---------- ROI ----------
-    roi = image.copy()
-    roi[mask_resized == 0] = 0
-
-    # ---------- HEATMAP ----------
-    heatmap = cv2.applyColorMap(mask_resized * 255, cv2.COLORMAP_JET)
-    heatmap = cv2.addWeighted(image, 0.6, heatmap, 0.4, 0)
-
-    return {
-        "Diagnosis": "NAFLD",
-        "Probability": round(prob, 3),
-        "Mean_HU": round(mean_hu, 2),
-        "Stage": stage,
-        "ROI_Image": encode_image(roi),
-        "Heatmap_Image": encode_image(heatmap),
-        "Segmentation_Mask": encode_image(mask_resized * 255)
-    }
+    except Exception as e:
+        return {
+            "ERROR": "NAFLD pipeline crashed",
+            "DETAILS": str(e)
+        }
