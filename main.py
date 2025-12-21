@@ -7,9 +7,9 @@ import io
 import base64
 import os
 
-app = FastAPI()
+app = FastAPI(title="NAFLD Detection API")
 
-# ================= PATHS =================
+# ================= LOAD MODELS =================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 nafld_model = tf.keras.models.load_model(
@@ -23,42 +23,38 @@ unet_model = tf.keras.models.load_model(
 )
 
 # ================= HELPERS =================
+
 def preprocess_for_cnn(image):
-    img = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    img = cv2.resize(img, (224, 224))
-    img = img / 255.0
-    return img.reshape(1, 224, 224, 1)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray, (224, 224))
+    gray = gray / 255.0
+    return gray.reshape(1, 224, 224, 1)
 
-def segment_liver_safe(image):
-    try:
-        img = cv2.resize(image, (256, 256))
-        img = img / 255.0
-        img = img.reshape(1, 256, 256, 3)
-        mask = unet_model.predict(img)[0, :, :, 0]
-        mask = (mask > 0.5).astype(np.uint8)
-        if np.sum(mask) == 0:
-            return None
-        return mask
-    except:
+def segment_liver(image):
+    # U-Net expects 1-channel input
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray, (256, 256))
+    gray = gray / 255.0
+    gray = gray.reshape(1, 256, 256, 1)
+
+    mask = unet_model.predict(gray, verbose=0)[0, :, :, 0]
+    mask = (mask > 0.3).astype(np.uint8)  # relaxed threshold
+    return mask
+
+def compute_mean_intensity(image, mask):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    liver_pixels = gray[mask == 1]
+
+    if liver_pixels.size == 0:
         return None
 
-def compute_mean_hu_safe(image, mask):
-    try:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        mask = cv2.resize(mask, (image.shape[1], image.shape[0]))
-        liver_pixels = gray[mask == 1]
-        if liver_pixels.size == 0:
-            return None
-        return float(np.mean(liver_pixels))
-    except:
-        return None
+    return float(np.mean(liver_pixels))
 
-def nafld_stage(mean_hu):
-    if mean_hu >= 55:
-        return "Early NAFLD"
-    elif 45 <= mean_hu < 55:
+def nafld_stage_from_intensity(value):
+    # NON-CLINICAL, RELATIVE STAGING
+    if value >= 140:
         return "Mild Steatosis"
-    elif 35 <= mean_hu < 45:
+    elif 110 <= value < 140:
         return "Moderate Steatosis"
     else:
         return "Severe Steatosis"
@@ -73,7 +69,9 @@ async def predict(file: UploadFile = File(...)):
     contents = await file.read()
     image = np.array(Image.open(io.BytesIO(contents)).convert("RGB"))
 
-    prob = float(nafld_model.predict(preprocess_for_cnn(image))[0][0])
+    # ---- CNN Prediction ----
+    cnn_input = preprocess_for_cnn(image)
+    prob = float(nafld_model.predict(cnn_input, verbose=0)[0][0])
 
     # ---------- HEALTHY ----------
     if prob < 0.5:
@@ -84,32 +82,37 @@ async def predict(file: UploadFile = File(...)):
         }
 
     # ---------- NAFLD ----------
-    mask = segment_liver_safe(image)
+    mask = segment_liver(image)
 
-    if mask is None:
-        return {
-            "Diagnosis": "NAFLD",
-            "Probability": round(prob, 3),
-            "Stage": "NAFLD Detected",
-            "Note": "Segmentation failed – HU not computed"
-        }
+    # Resize mask to original image size
+    mask_resized = cv2.resize(
+        mask, (image.shape[1], image.shape[0]),
+        interpolation=cv2.INTER_NEAREST
+    )
 
-    mean_hu = compute_mean_hu_safe(image, mask)
-    stage = nafld_stage(mean_hu) if mean_hu else "NAFLD Detected"
+    mean_intensity = compute_mean_intensity(image, mask_resized)
 
-    mask_resized = cv2.resize(mask, (image.shape[1], image.shape[0]))
+    if mean_intensity is None:
+        stage = "NAFLD Detected"
+        note = "Segmentation low confidence – intensity not computed"
+    else:
+        stage = nafld_stage_from_intensity(mean_intensity)
+        note = "Relative intensity value (non-clinical)"
 
+    # ROI
     roi = image.copy()
     roi[mask_resized == 0] = 0
 
+    # Heatmap
     heatmap = cv2.applyColorMap(mask_resized * 255, cv2.COLORMAP_JET)
     heatmap = cv2.addWeighted(image, 0.6, heatmap, 0.4, 0)
 
     return {
         "Diagnosis": "NAFLD",
         "Probability": round(prob, 3),
-        "Mean_HU": round(mean_hu, 2) if mean_hu else None,
+        "Relative_Intensity": round(mean_intensity, 2) if mean_intensity else None,
         "Stage": stage,
+        "Note": note,
         "ROI_Image": encode_image(roi),
         "Heatmap_Image": encode_image(heatmap),
         "Segmentation_Mask": encode_image(mask_resized * 255)
