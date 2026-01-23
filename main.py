@@ -1,16 +1,23 @@
-from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
-import cv2
-import tensorflow as tf
 from PIL import Image
+import tensorflow as tf
 import io
-import base64
 
 app = FastAPI()
 
-# Load TFLite model once at startup
-interpreter = tf.lite.Interpreter(model_path="nafld_model_quant.tflite")
+# Allow Android app access
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Load TFLite model
+interpreter = tf.lite.Interpreter(model_path="nafld_model_quantized.tflite")
 interpreter.allocate_tensors()
 
 input_details = interpreter.get_input_details()
@@ -18,47 +25,50 @@ output_details = interpreter.get_output_details()
 
 def preprocess_image(image):
     image = image.resize((224, 224))
+    image = image.convert("L")  # Convert to grayscale
     img_array = np.array(image).astype(np.float32) / 255.0
-    img_array = np.expand_dims(img_array, axis=0)
+    img_array = np.expand_dims(img_array, axis=-1)  # (224,224,1)
+    img_array = np.expand_dims(img_array, axis=0)   # (1,224,224,1)
     return img_array
 
-def generate_heatmap(original, prediction_map):
-    heatmap = cv2.applyColorMap(np.uint8(255 * prediction_map), cv2.COLORMAP_JET)
-    overlay = cv2.addWeighted(original, 0.6, heatmap, 0.4, 0)
-    return overlay
-
-def encode_image(img):
-    _, buffer = cv2.imencode(".png", img)
-    return base64.b64encode(buffer).decode("utf-8")
+def classify_stage(prob):
+    if prob < 0.25:
+        return "Normal Liver"
+    elif prob < 0.5:
+        return "Mild NAFLD"
+    elif prob < 0.75:
+        return "Moderate NAFLD"
+    else:
+        return "Severe NAFLD"
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     try:
         image_bytes = await file.read()
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        input_tensor = preprocess_image(image)
+        image = Image.open(io.BytesIO(image_bytes))
 
-        interpreter.set_tensor(input_details[0]['index'], input_tensor)
+        input_data = preprocess_image(image)
+
+        interpreter.set_tensor(input_details[0]['index'], input_data)
         interpreter.invoke()
-        output = interpreter.get_tensor(output_details[0]['index'])
 
-        stage_index = int(np.argmax(output))
-        stages = ["Normal", "Mild", "Moderate", "Severe"]
-        stage = stages[stage_index]
+        prediction = interpreter.get_tensor(output_details[0]['index'])[0][0]
 
-        # Fake segmentation map (replace later with real U-Net output)
-        seg_map = np.random.rand(224, 224)
+        stage = classify_stage(prediction)
 
-        original = cv2.resize(np.array(image), (224, 224))
-        heatmap_img = generate_heatmap(original, seg_map)
-
-        response = {
-            "stage": stage,
-            "heatmap": encode_image(heatmap_img),
-            "segmentation": encode_image(heatmap_img)
+        return {
+            "Diagnosis": "NAFLD",
+            "Probability": float(prediction),
+            "Stage": stage,
+            "Status": "Success"
         }
 
-        return JSONResponse(content=response)
-
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return {
+            "error": "NAFLD pipeline crashed",
+            "details": str(e)
+        }
+
+@app.get("/")
+def root():
+    return {"message": "NAFLD Detection API Running"}
