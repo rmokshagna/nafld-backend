@@ -1,59 +1,64 @@
 from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import JSONResponse
 import numpy as np
 import cv2
+import tensorflow as tf
 from PIL import Image
 import io
 import base64
-import tensorflow as tf
 
 app = FastAPI()
 
-# ===== Load Quantized TFLite Model =====
+# Load TFLite model once at startup
 interpreter = tf.lite.Interpreter(model_path="nafld_model_quant.tflite")
 interpreter.allocate_tensors()
 
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
 
-# ===== Helpers =====
-def preprocess(image):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    resized = cv2.resize(gray, (224, 224))
-    norm = resized / 255.0
-    return norm.reshape(1, 224, 224, 1).astype(np.float32)
+def preprocess_image(image):
+    image = image.resize((224, 224))
+    img_array = np.array(image).astype(np.float32) / 255.0
+    img_array = np.expand_dims(img_array, axis=0)
+    return img_array
 
-def predict_nafld(image):
-    input_data = preprocess(image)
-    interpreter.set_tensor(input_details[0]['index'], input_data)
-    interpreter.invoke()
-    output = interpreter.get_tensor(output_details[0]['index'])
-    return float(output[0][0])
+def generate_heatmap(original, prediction_map):
+    heatmap = cv2.applyColorMap(np.uint8(255 * prediction_map), cv2.COLORMAP_JET)
+    overlay = cv2.addWeighted(original, 0.6, heatmap, 0.4, 0)
+    return overlay
 
 def encode_image(img):
     _, buffer = cv2.imencode(".png", img)
     return base64.b64encode(buffer).decode("utf-8")
 
-# ===== API =====
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    contents = await file.read()
-    image = np.array(Image.open(io.BytesIO(contents)).convert("RGB"))
+    try:
+        image_bytes = await file.read()
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        input_tensor = preprocess_image(image)
 
-    prob = predict_nafld(image)
+        interpreter.set_tensor(input_details[0]['index'], input_tensor)
+        interpreter.invoke()
+        output = interpreter.get_tensor(output_details[0]['index'])
 
-    if prob < 0.5:
-        return {
-            "Diagnosis": "Healthy Liver",
-            "Probability": round(prob, 3),
-            "Stage": "Normal"
+        stage_index = int(np.argmax(output))
+        stages = ["Normal", "Mild", "Moderate", "Severe"]
+        stage = stages[stage_index]
+
+        # Fake segmentation map (replace later with real U-Net output)
+        seg_map = np.random.rand(224, 224)
+
+        original = cv2.resize(np.array(image), (224, 224))
+        heatmap_img = generate_heatmap(original, seg_map)
+
+        response = {
+            "stage": stage,
+            "heatmap": encode_image(heatmap_img),
+            "segmentation": encode_image(heatmap_img)
         }
 
-    # Simple heatmap (no heavy segmentation to avoid memory crash)
-    heatmap = cv2.applyColorMap(cv2.cvtColor(image, cv2.COLOR_RGB2GRAY), cv2.COLORMAP_JET)
+        return JSONResponse(content=response)
 
-    return {
-        "Diagnosis": "NAFLD",
-        "Probability": round(prob, 3),
-        "Stage": "Fatty Liver Detected",
-        "Heatmap": encode_image(heatmap)
-    }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
