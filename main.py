@@ -22,8 +22,8 @@ unet_output = unet_interpreter.get_output_details()
 
 def preprocess_cnn(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    img = cv2.resize(gray, (256, 256)) / 255.0
-    img = img.reshape(1, 256, 256, 1).astype(np.float32)
+    img = cv2.resize(gray, (224, 224)) / 255.0
+    img = img.reshape(1, 224, 224, 1).astype(np.float32)
     return img
 
 def preprocess_unet(image):
