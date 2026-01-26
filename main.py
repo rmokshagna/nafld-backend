@@ -1,74 +1,78 @@
-from fastapi import FastAPI, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import JSONResponse
 import numpy as np
-from PIL import Image
+import cv2
 import tensorflow as tf
-import io
+import base64
+from io import BytesIO
+from PIL import Image
 
 app = FastAPI()
 
-# Allow Android app access
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Load TFLite model
+# Load models
 interpreter = tf.lite.Interpreter(model_path="nafld_model_quant.tflite")
 interpreter.allocate_tensors()
+
+seg_model = tf.keras.models.load_model("liver_unet.keras", compile=False)
 
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
 
-def preprocess_image(image):
-    image = image.resize((224, 224))
-    image = image.convert("L")  # Convert to grayscale
-    img_array = np.array(image).astype(np.float32) / 255.0
-    img_array = np.expand_dims(img_array, axis=-1)  # (224,224,1)
-    img_array = np.expand_dims(img_array, axis=0)   # (1,224,224,1)
-    return img_array
+IMG_SIZE = 224
 
-def classify_stage(prob):
-    if prob < 0.25:
-        return "Normal Liver"
-    elif prob < 0.5:
-        return "Mild NAFLD"
-    elif prob < 0.75:
-        return "Moderate NAFLD"
-    else:
-        return "Severe NAFLD"
+def preprocess(image):
+    image = cv2.resize(image, (IMG_SIZE, IMG_SIZE))
+    image = image / 255.0
+    image = np.expand_dims(image, axis=(0, -1))
+    return image.astype(np.float32)
+
+def to_base64(img):
+    _, buffer = cv2.imencode(".png", img)
+    return base64.b64encode(buffer).decode("utf-8")
+
+def gradcam(image):
+    heatmap = cv2.applyColorMap(image, cv2.COLORMAP_JET)
+    return heatmap
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     try:
-        image_bytes = await file.read()
-        image = Image.open(io.BytesIO(image_bytes))
+        contents = await file.read()
+        img = Image.open(BytesIO(contents)).convert("L")
+        img = np.array(img)
 
-        input_data = preprocess_image(image)
+        input_data = preprocess(img)
 
         interpreter.set_tensor(input_details[0]['index'], input_data)
         interpreter.invoke()
-
         prediction = interpreter.get_tensor(output_details[0]['index'])[0][0]
 
-        stage = classify_stage(prediction)
+        if prediction > 0.5:
+            stage = "Severe NAFLD"
+            diagnosis = "NAFLD"
+        else:
+            stage = "Normal Liver"
+            diagnosis = "Normal"
 
-        return {
-            "Diagnosis": "NAFLD",
+        # Segmentation
+        seg_input = cv2.resize(img, (256, 256)) / 255.0
+        seg_input = np.expand_dims(seg_input, axis=(0, -1))
+        seg_mask = seg_model.predict(seg_input)[0]
+        seg_mask = np.argmax(seg_mask, axis=-1)
+        seg_mask = (seg_mask * 85).astype(np.uint8)
+        seg_mask = cv2.applyColorMap(seg_mask, cv2.COLORMAP_JET)
+
+        # Heatmap
+        heatmap = gradcam(cv2.resize(img, (IMG_SIZE, IMG_SIZE)))
+
+        return JSONResponse({
+            "Status": "Success",
+            "Diagnosis": diagnosis,
             "Probability": float(prediction),
             "Stage": stage,
-            "Status": "Success"
-        }
+            "Heatmap": to_base64(heatmap),
+            "Segmentation": to_base64(seg_mask)
+        })
 
     except Exception as e:
-        return {
-            "error": "NAFLD pipeline crashed",
-            "details": str(e)
-        }
-
-@app.get("/")
-def root():
-    return {"message": "NAFLD Detection API Running"}
+        return JSONResponse({"Status": "Error", "Message": str(e)})
