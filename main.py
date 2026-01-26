@@ -17,7 +17,7 @@ app.add_middleware(
 )
 
 # Load TFLite model
-interpreter = tf.lite.Interpreter(model_path="nafld_model_quantized.tflite")
+interpreter = tf.lite.Interpreter(model_path="nafld_model_quant.tflite")
 interpreter.allocate_tensors()
 
 input_details = interpreter.get_input_details()
