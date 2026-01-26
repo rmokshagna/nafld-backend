@@ -1,78 +1,71 @@
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
-import numpy as np
-import cv2
 import tensorflow as tf
-import base64
-from io import BytesIO
+import numpy as np
+import cv2, base64
 from PIL import Image
+from io import BytesIO
 
 app = FastAPI()
 
-# Load models
-interpreter = tf.lite.Interpreter(model_path="nafld_model_quant.tflite")
-interpreter.allocate_tensors()
+interpreter = None
+seg_model = None
 
-seg_model = tf.keras.models.load_model("liver_unet.keras", compile=False)
+def load_models():
+    global interpreter, seg_model
+    if interpreter is None:
+        interpreter = tf.lite.Interpreter(model_path="nafld_model_quant.tflite")
+        interpreter.allocate_tensors()
+    if seg_model is None:
+        seg_model = tf.keras.models.load_model("liver_unet.keras", compile=False)
 
-input_details = interpreter.get_input_details()
-output_details = interpreter.get_output_details()
+def preprocess(img):
+    img = cv2.resize(img, (224,224))
+    img = img/255.0
+    img = np.expand_dims(img, axis=(0,-1)).astype(np.float32)
+    return img
 
-IMG_SIZE = 224
-
-def preprocess(image):
-    image = cv2.resize(image, (IMG_SIZE, IMG_SIZE))
-    image = image / 255.0
-    image = np.expand_dims(image, axis=(0, -1))
-    return image.astype(np.float32)
-
-def to_base64(img):
+def encode(img):
     _, buffer = cv2.imencode(".png", img)
-    return base64.b64encode(buffer).decode("utf-8")
-
-def gradcam(image):
-    heatmap = cv2.applyColorMap(image, cv2.COLORMAP_JET)
-    return heatmap
+    return base64.b64encode(buffer).decode()
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     try:
-        contents = await file.read()
-        img = Image.open(BytesIO(contents)).convert("L")
+        load_models()
+
+        data = await file.read()
+        img = Image.open(BytesIO(data)).convert("L")
         img = np.array(img)
 
-        input_data = preprocess(img)
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
 
-        interpreter.set_tensor(input_details[0]['index'], input_data)
+        x = preprocess(img)
+        interpreter.set_tensor(input_details[0]['index'], x)
         interpreter.invoke()
-        prediction = interpreter.get_tensor(output_details[0]['index'])[0][0]
+        prob = float(interpreter.get_tensor(output_details[0]['index'])[0][0])
 
-        if prediction > 0.5:
-            stage = "Severe NAFLD"
-            diagnosis = "NAFLD"
-        else:
-            stage = "Normal Liver"
-            diagnosis = "Normal"
+        stage = "Severe NAFLD" if prob > 0.5 else "Normal Liver"
 
         # Segmentation
-        seg_input = cv2.resize(img, (256, 256)) / 255.0
-        seg_input = np.expand_dims(seg_input, axis=(0, -1))
-        seg_mask = seg_model.predict(seg_input)[0]
-        seg_mask = np.argmax(seg_mask, axis=-1)
-        seg_mask = (seg_mask * 85).astype(np.uint8)
-        seg_mask = cv2.applyColorMap(seg_mask, cv2.COLORMAP_JET)
+        seg_in = cv2.resize(img, (256,256))/255.0
+        seg_in = np.expand_dims(seg_in, axis=(0,-1))
+        seg = seg_model.predict(seg_in)[0]
+        seg = np.argmax(seg, axis=-1).astype(np.uint8)*85
+        seg = cv2.applyColorMap(seg, cv2.COLORMAP_JET)
 
-        # Heatmap
-        heatmap = gradcam(cv2.resize(img, (IMG_SIZE, IMG_SIZE)))
+        # Heatmap (simple CAM proxy)
+        heat = cv2.applyColorMap(cv2.resize(img,(224,224)), cv2.COLORMAP_JET)
 
         return JSONResponse({
             "Status": "Success",
-            "Diagnosis": diagnosis,
-            "Probability": float(prediction),
+            "Diagnosis": "NAFLD" if prob>0.5 else "Normal",
+            "Probability": prob,
             "Stage": stage,
-            "Heatmap": to_base64(heatmap),
-            "Segmentation": to_base64(seg_mask)
+            "Heatmap": encode(heat),
+            "Segmentation": encode(seg)
         })
 
     except Exception as e:
-        return JSONResponse({"Status": "Error", "Message": str(e)})
+        return JSONResponse({"Status":"Error","Message":str(e)})
