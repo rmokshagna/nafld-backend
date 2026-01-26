@@ -1,71 +1,97 @@
 from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import JSONResponse
-import tensorflow as tf
 import numpy as np
-import cv2, base64
+import cv2
+import tensorflow as tf
 from PIL import Image
-from io import BytesIO
+import io, base64, os
 
 app = FastAPI()
 
-interpreter = None
-seg_model = None
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-def load_models():
-    global interpreter, seg_model
-    if interpreter is None:
-        interpreter = tf.lite.Interpreter(model_path="nafld_model_quant.tflite")
-        interpreter.allocate_tensors()
-    if seg_model is None:
-        seg_model = tf.keras.models.load_model("liver_unet.keras", compile=False)
+# ================= LOAD TFLITE MODELS =================
+cnn_interpreter = tf.lite.Interpreter(
+    model_path=os.path.join(BASE_DIR, "nafld_model_quant.tflite")
+)
+cnn_interpreter.allocate_tensors()
+cnn_input = cnn_interpreter.get_input_details()
+cnn_output = cnn_interpreter.get_output_details()
 
-def preprocess(img):
-    img = cv2.resize(img, (224,224))
-    img = img/255.0
-    img = np.expand_dims(img, axis=(0,-1)).astype(np.float32)
+unet_interpreter = tf.lite.Interpreter(
+    model_path=os.path.join(BASE_DIR, "unet_fat_segmentation_quant.tflite")
+)
+unet_interpreter.allocate_tensors()
+unet_input = unet_interpreter.get_input_details()
+unet_output = unet_interpreter.get_output_details()
+
+# ================= HELPERS =================
+def preprocess_cnn(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    img = cv2.resize(gray, (224, 224))
+    img = img / 255.0
+    img = img.reshape(1, 224, 224, 1).astype(np.float32)
     return img
 
-def encode(img):
-    _, buffer = cv2.imencode(".png", img)
-    return base64.b64encode(buffer).decode()
+def preprocess_unet(image):
+    img = cv2.resize(image, (256, 256))
+    img = img / 255.0
+    img = img.reshape(1, 256, 256, 3).astype(np.float32)
+    return img
 
+def encode_image(img):
+    _, buffer = cv2.imencode(".png", img)
+    return base64.b64encode(buffer).decode("utf-8")
+
+def nafld_stage(prob):
+    if prob < 0.3:
+        return "Mild NAFLD"
+    elif prob < 0.7:
+        return "Moderate NAFLD"
+    else:
+        return "Severe NAFLD"
+
+# ================= API =================
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    try:
-        load_models()
+    contents = await file.read()
+    image = np.array(Image.open(io.BytesIO(contents)).convert("RGB"))
 
-        data = await file.read()
-        img = Image.open(BytesIO(data)).convert("L")
-        img = np.array(img)
+    # -------- CNN PREDICTION --------
+    cnn_input_data = preprocess_cnn(image)
+    cnn_interpreter.set_tensor(cnn_input[0]['index'], cnn_input_data)
+    cnn_interpreter.invoke()
+    prob = float(cnn_interpreter.get_tensor(cnn_output[0]['index'])[0][0])
 
-        input_details = interpreter.get_input_details()
-        output_details = interpreter.get_output_details()
+    # -------- HEALTHY --------
+    if prob < 0.5:
+        return {
+            "Diagnosis": "Healthy Liver",
+            "Probability": round(prob, 6),
+            "Stage": "Normal Liver",
+            "Status": "Success"
+        }
 
-        x = preprocess(img)
-        interpreter.set_tensor(input_details[0]['index'], x)
-        interpreter.invoke()
-        prob = float(interpreter.get_tensor(output_details[0]['index'])[0][0])
+    # -------- NAFLD SEGMENTATION --------
+    unet_input_data = preprocess_unet(image)
+    unet_interpreter.set_tensor(unet_input[0]['index'], unet_input_data)
+    unet_interpreter.invoke()
+    mask = unet_interpreter.get_tensor(unet_output[0]['index'])[0, :, :, 0]
+    mask = (mask > 0.5).astype(np.uint8)
 
-        stage = "Severe NAFLD" if prob > 0.5 else "Normal Liver"
+    mask_resized = cv2.resize(mask, (image.shape[1], image.shape[0]))
 
-        # Segmentation
-        seg_in = cv2.resize(img, (256,256))/255.0
-        seg_in = np.expand_dims(seg_in, axis=(0,-1))
-        seg = seg_model.predict(seg_in)[0]
-        seg = np.argmax(seg, axis=-1).astype(np.uint8)*85
-        seg = cv2.applyColorMap(seg, cv2.COLORMAP_JET)
+    roi = image.copy()
+    roi[mask_resized == 0] = 0
 
-        # Heatmap (simple CAM proxy)
-        heat = cv2.applyColorMap(cv2.resize(img,(224,224)), cv2.COLORMAP_JET)
+    heatmap = cv2.applyColorMap(mask_resized * 255, cv2.COLORMAP_JET)
+    heatmap = cv2.addWeighted(image, 0.6, heatmap, 0.4, 0)
 
-        return JSONResponse({
-            "Status": "Success",
-            "Diagnosis": "NAFLD" if prob>0.5 else "Normal",
-            "Probability": prob,
-            "Stage": stage,
-            "Heatmap": encode(heat),
-            "Segmentation": encode(seg)
-        })
-
-    except Exception as e:
-        return JSONResponse({"Status":"Error","Message":str(e)})
+    return {
+        "Diagnosis": "NAFLD",
+        "Probability": round(prob, 6),
+        "Stage": nafld_stage(prob),
+        "Segmentation_Mask": encode_image(mask_resized * 255),
+        "ROI_Image": encode_image(roi),
+        "Heatmap_Image": encode_image(heatmap),
+        "Status": "Success"
+    }
