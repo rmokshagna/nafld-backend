@@ -32,7 +32,7 @@ def preprocess_cnn(img):
 
 def preprocess_unet(img):
     img = cv2.resize(img, (256, 256)) / 255.0
-    return img.reshape(1, 256, 256, 3).astype(np.float32)
+    return img.reshape(1, 256, 256, 1).astype(np.float32)
 
 
 def encode_image(img):
@@ -60,13 +60,17 @@ async def predict(file: UploadFile = File(...)):
         }
 
     # ---- U-Net Segmentation ----
-    unet_input_data = preprocess_unet(image)
-    unet_interpreter.set_tensor(unet_input, unet_input_data)
-    unet_interpreter.invoke()
-    mask = unet_interpreter.get_tensor(unet_output)[0, :, :, 0]
+   # Prepare image for UNet (must be grayscale, 1 channel)
+gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+gray = cv2.resize(gray, (256, 256))
+gray = gray.astype(np.float32) / 255.0
+gray = np.expand_dims(gray, axis=-1)      # (256,256,1)
+gray = np.expand_dims(gray, axis=0)       # (1,256,256,1)
 
-    mask = (mask > 0.5).astype(np.uint8) * 255
-    mask_resized = cv2.resize(mask, (image.shape[1], image.shape[0]))
+unet_input = unet_interpreter.get_input_details()[0]['index']
+unet_interpreter.set_tensor(unet_input, gray)
+unet_interpreter.invoke()
+
 
     # ---- Fat Ratio ----
     fat_pixels = np.sum(mask_resized == 255)
