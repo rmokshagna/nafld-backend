@@ -32,7 +32,7 @@ def preprocess_cnn(img):
 
 def preprocess_unet(img):
     img = cv2.resize(img, (256, 256)) / 255.0
-    return img.reshape(1, 256, 256, 1).astype(np.float32)
+    return img.reshape(1, 256, 256, 3).astype(np.float32)
 
 
 def encode_image(img):
