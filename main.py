@@ -1,89 +1,83 @@
-from fastapi import FastAPI, File, UploadFile
-import tensorflow as tf
+from fastapi import FastAPI, UploadFile, File
 import numpy as np
 import cv2
-import base64
-from io import BytesIO
+import tensorflow as tf
 from PIL import Image
+import io, base64, os
 
 app = FastAPI()
 
-# Load models once (important for Render stability)
-clf_interpreter = tf.lite.Interpreter(model_path="nafld_model_quant.tflite")
-clf_interpreter.allocate_tensors()
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-seg_interpreter = tf.lite.Interpreter(model_path="unet_fat_segmentation_quant.tflite")
-seg_interpreter.allocate_tensors()
+# Load TFLite models
+cnn_interpreter = tf.lite.Interpreter(model_path=os.path.join(BASE_DIR, "nafld_model_quant.tflite"))
+cnn_interpreter.allocate_tensors()
+cnn_input = cnn_interpreter.get_input_details()
+cnn_output = cnn_interpreter.get_output_details()
 
-clf_input = clf_interpreter.get_input_details()
-clf_output = clf_interpreter.get_output_details()
+unet_interpreter = tf.lite.Interpreter(model_path=os.path.join(BASE_DIR, "unet_fat_segmentation_quant.tflite"))
+unet_interpreter.allocate_tensors()
+unet_input = unet_interpreter.get_input_details()
+unet_output = unet_interpreter.get_output_details()
 
-seg_input = seg_interpreter.get_input_details()
-seg_output = seg_interpreter.get_output_details()
-
-
-def preprocess(img):
-    img = cv2.resize(img, (256, 256))
-    img = img.astype(np.float32) / 255.0
-    img = np.expand_dims(img, axis=(0, -1))
+def preprocess_cnn(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    img = cv2.resize(gray, (224, 224)) / 255.0
+    img = img.reshape(1, 224, 224, 1).astype(np.float32)
     return img
 
+def preprocess_unet(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    img = cv2.resize(gray, (256, 256)) / 255.0
+    img = img.reshape(1, 256, 256, 1).astype(np.float32)
+    return img
 
-def to_base64(image):
-    pil = Image.fromarray(image)
-    buffer = BytesIO()
-    pil.save(buffer, format="PNG")
-    return base64.b64encode(buffer.getvalue()).decode()
-
+def encode(img):
+    _, buf = cv2.imencode(".png", img)
+    return base64.b64encode(buf).decode()
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
+    contents = await file.read()
+    image = np.array(Image.open(io.BytesIO(contents)).convert("RGB"))
 
-    image_bytes = await file.read()
-    img = np.array(Image.open(BytesIO(image_bytes)).convert("L"))
+    # CNN
+    cnn_img = preprocess_cnn(image)
+    cnn_interpreter.set_tensor(cnn_input[0]['index'], cnn_img)
+    cnn_interpreter.invoke()
+    prob = float(cnn_interpreter.get_tensor(cnn_output[0]['index'])[0][0])
 
-    input_tensor = preprocess(img)
-
-    clf_interpreter.set_tensor(clf_input[0]['index'], input_tensor)
-    clf_interpreter.invoke()
-    prob = float(clf_interpreter.get_tensor(clf_output[0]['index'])[0][0])
-
+    # Healthy
     if prob < 0.5:
         return {
-            "Diagnosis": "Normal",
-            "Probability": prob,
+            "Diagnosis": "Healthy Liver",
+            "Probability": round(prob, 6),
             "Stage": "Normal Liver",
             "Status": "Success"
         }
 
-    # ---- Fat Segmentation ----
-    seg_interpreter.set_tensor(seg_input[0]['index'], input_tensor)
-    seg_interpreter.invoke()
-    mask = seg_interpreter.get_tensor(seg_output[0]['index'])[0, :, :, 0]
-    mask = (mask > 0.5).astype(np.uint8) * 255
+    # NAFLD segmentation
+    unet_img = preprocess_unet(image)
+    unet_interpreter.set_tensor(unet_input[0]['index'], unet_img)
+    unet_interpreter.invoke()
+    mask = unet_interpreter.get_tensor(unet_output[0]['index'])[0, :, :, 0]
+    mask = (mask > 0.5).astype(np.uint8)
 
-    # ---- Heatmap ----
-    heatmap = cv2.applyColorMap(mask, cv2.COLORMAP_JET)
-    overlay = cv2.addWeighted(cv2.cvtColor(img, cv2.COLOR_GRAY2BGR), 0.6, heatmap, 0.4, 0)
+    mask_resized = cv2.resize(mask, (image.shape[1], image.shape[0]))
+    roi = image.copy()
+    roi[mask_resized == 0] = 0
 
-    # ---- HU Estimation (Fat region mean) ----
-    hu_region = img[mask == 255]
-    hu_value = float(np.mean(hu_region)) if len(hu_region) > 0 else -100
+    heatmap = cv2.applyColorMap(mask_resized * 255, cv2.COLORMAP_JET)
+    overlay = cv2.addWeighted(image, 0.6, heatmap, 0.4, 0)
 
-    # ---- Stage ----
-    if prob < 0.65:
-        stage = "Mild NAFLD"
-    elif prob < 0.85:
-        stage = "Moderate NAFLD"
-    else:
-        stage = "Severe NAFLD"
+    stage = "Severe NAFLD" if prob > 0.8 else "Moderate NAFLD"
 
     return {
         "Diagnosis": "NAFLD",
-        "Probability": prob,
+        "Probability": round(prob, 6),
         "Stage": stage,
-        "HU_Fat_Mean": hu_value,
-        "SegmentationMask": to_base64(mask),
-        "Heatmap": to_base64(overlay),
+        "Segmentation_Mask": encode(mask_resized * 255),
+        "ROI_Image": encode(roi),
+        "Heatmap_Image": encode(overlay),
         "Status": "Success"
     }
