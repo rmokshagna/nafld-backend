@@ -9,75 +9,225 @@ app = FastAPI()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Load TFLite models
-cnn_interpreter = tf.lite.Interpreter(model_path=os.path.join(BASE_DIR, "nafld_model_quant.tflite"))
+# ===============================
+# LOAD TFLITE MODELS
+# ===============================
+
+cnn_interpreter = tf.lite.Interpreter(
+    model_path=os.path.join(BASE_DIR, "nafld_model_quant.tflite")
+)
 cnn_interpreter.allocate_tensors()
+
 cnn_input = cnn_interpreter.get_input_details()
 cnn_output = cnn_interpreter.get_output_details()
 
-unet_interpreter = tf.lite.Interpreter(model_path=os.path.join(BASE_DIR, "unet_fat_segmentation_quant.tflite"))
+
+unet_interpreter = tf.lite.Interpreter(
+    model_path=os.path.join(BASE_DIR, "unet_fat_segmentation_quant.tflite")
+)
 unet_interpreter.allocate_tensors()
+
 unet_input = unet_interpreter.get_input_details()
 unet_output = unet_interpreter.get_output_details()
 
+
+# ===============================
+# IMAGE PREPROCESSING
+# ===============================
+
 def preprocess_cnn(image):
+
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     img = cv2.resize(gray, (224, 224)) / 255.0
     img = img.reshape(1, 224, 224, 1).astype(np.float32)
+
     return img
 
+
 def preprocess_unet(image):
+
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     img = cv2.resize(gray, (256, 256)) / 255.0
     img = img.reshape(1, 256, 256, 1).astype(np.float32)
+
     return img
 
+
+# ===============================
+# BASE64 ENCODER
+# ===============================
+
 def encode(img):
+
     _, buf = cv2.imencode(".png", img)
+
     return base64.b64encode(buf).decode()
+
+
+# ===============================
+# HU CALCULATION
+# ===============================
+
+def calculate_mean_hu(image, mask):
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    liver_pixels = gray[mask == 1]
+
+    if liver_pixels.size == 0:
+        return 0
+
+    mean_hu = np.mean(liver_pixels)
+
+    return float(mean_hu)
+
+
+# ===============================
+# NAFLD STAGING BASED ON HU
+# ===============================
+
+def determine_stage(mean_hu):
+
+    if mean_hu > 55:
+        return "Normal Liver"
+
+    elif 40 <= mean_hu <= 55:
+        return "Mild NAFLD"
+
+    elif 30 <= mean_hu < 40:
+        return "Moderate NAFLD"
+
+    else:
+        return "Severe NAFLD"
+
+
+# ===============================
+# PREDICTION API
+# ===============================
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
+
     contents = await file.read()
+
     image = np.array(Image.open(io.BytesIO(contents)).convert("RGB"))
 
-    # CNN
-    cnn_img = preprocess_cnn(image)
-    cnn_interpreter.set_tensor(cnn_input[0]['index'], cnn_img)
-    cnn_interpreter.invoke()
-    prob = float(cnn_interpreter.get_tensor(cnn_output[0]['index'])[0][0])
+    # ===============================
+    # CNN DETECTION
+    # ===============================
 
-    # Healthy
+    cnn_img = preprocess_cnn(image)
+
+    cnn_interpreter.set_tensor(cnn_input[0]['index'], cnn_img)
+
+    cnn_interpreter.invoke()
+
+    prob = float(
+        cnn_interpreter.get_tensor(cnn_output[0]['index'])[0][0]
+    )
+
+
+    # ===============================
+    # HEALTHY CASE
+    # ===============================
+
     if prob < 0.5:
+
         return {
+
             "Diagnosis": "Healthy Liver",
             "Probability": round(prob, 6),
+            "Mean_HU": None,
             "Stage": "Normal Liver",
             "Status": "Success"
+
         }
 
-    # NAFLD segmentation
+
+    # ===============================
+    # SEGMENTATION (UNET)
+    # ===============================
+
     unet_img = preprocess_unet(image)
+
     unet_interpreter.set_tensor(unet_input[0]['index'], unet_img)
+
     unet_interpreter.invoke()
+
     mask = unet_interpreter.get_tensor(unet_output[0]['index'])[0, :, :, 0]
+
     mask = (mask > 0.5).astype(np.uint8)
 
-    mask_resized = cv2.resize(mask, (image.shape[1], image.shape[0]))
+
+    # Resize mask to original image
+
+    mask_resized = cv2.resize(
+        mask,
+        (image.shape[1], image.shape[0])
+    )
+
+
+    # ===============================
+    # ROI EXTRACTION
+    # ===============================
+
     roi = image.copy()
+
     roi[mask_resized == 0] = 0
 
-    heatmap = cv2.applyColorMap(mask_resized * 255, cv2.COLORMAP_JET)
-    overlay = cv2.addWeighted(image, 0.6, heatmap, 0.4, 0)
 
-    stage = "Severe NAFLD" if prob > 0.8 else "Moderate NAFLD"
+    # ===============================
+    # HEATMAP GENERATION
+    # ===============================
+
+    heatmap = cv2.applyColorMap(
+        mask_resized * 255,
+        cv2.COLORMAP_JET
+    )
+
+    overlay = cv2.addWeighted(
+        image,
+        0.6,
+        heatmap,
+        0.4,
+        0
+    )
+
+
+    # ===============================
+    # HU CALCULATION
+    # ===============================
+
+    mean_hu = calculate_mean_hu(image, mask_resized)
+
+
+    # ===============================
+    # STAGE DETERMINATION
+    # ===============================
+
+    stage = determine_stage(mean_hu)
+
+
+    # ===============================
+    # API RESPONSE
+    # ===============================
 
     return {
+
         "Diagnosis": "NAFLD",
+
         "Probability": round(prob, 6),
+
+        "Mean_HU": round(mean_hu, 2),
+
         "Stage": stage,
+
         "Segmentation_Mask": encode(mask_resized * 255),
+
         "ROI_Image": encode(roi),
+
         "Heatmap_Image": encode(overlay),
+
         "Status": "Success"
+
     }
