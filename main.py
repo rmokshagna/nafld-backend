@@ -3,9 +3,7 @@ import numpy as np
 import cv2
 import tensorflow as tf
 from PIL import Image
-import io
-import base64
-import os
+import io, base64, os
 
 app = FastAPI()
 
@@ -14,7 +12,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # ===============================
 # LOAD TFLITE MODELS
 # ===============================
-
 cnn_interpreter = tf.lite.Interpreter(
     model_path=os.path.join(BASE_DIR, "nafld_model_quant.tflite")
 )
@@ -30,35 +27,115 @@ unet_input = unet_interpreter.get_input_details()
 unet_output = unet_interpreter.get_output_details()
 
 # ===============================
-# IMAGE PREPROCESSING
+# PREPROCESSING
 # ===============================
-
 def preprocess_cnn(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    img = cv2.resize(gray, (224, 224))
-    img = img / 255.0
+    img = cv2.resize(gray, (224, 224)) / 255.0
     img = img.reshape(1, 224, 224, 1).astype(np.float32)
     return img
 
 def preprocess_unet(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    img = cv2.resize(gray, (256, 256))
-    img = img / 255.0
+    img = cv2.resize(gray, (256, 256)) / 255.0
     img = img.reshape(1, 256, 256, 1).astype(np.float32)
     return img
 
 # ===============================
-# BASE64 ENCODER
+# ENCODER
 # ===============================
-
 def encode(img):
     _, buf = cv2.imencode(".png", img)
-    return base64.b64encode(buf).decode("utf-8")
+    return base64.b64encode(buf).decode()
 
 # ===============================
-# HU / MEAN DENSITY CALCULATION
+# MASK POST-PROCESSING
 # ===============================
+def clean_liver_mask(mask, original_shape):
+    mask = (mask > 0.5).astype(np.uint8) * 255
+    mask = cv2.resize(mask, (original_shape[1], original_shape[0]))
 
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    clean_mask = np.zeros_like(mask)
+
+    if contours:
+        largest = max(contours, key=cv2.contourArea)
+        cv2.drawContours(clean_mask, [largest], -1, 255, thickness=cv2.FILLED)
+
+    return (clean_mask > 0).astype(np.uint8)
+
+# ===============================
+# ROI WITH LIVER BOUNDARY
+# ===============================
+def create_roi_with_boundary(image, liver_mask):
+    roi = image.copy()
+
+    # darken outside liver slightly
+    dark = (roi * 0.2).astype(np.uint8)
+    roi[liver_mask == 0] = dark[liver_mask == 0]
+
+    contours, _ = cv2.findContours(
+        (liver_mask * 255).astype(np.uint8),
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    cv2.drawContours(roi, contours, -1, (0, 255, 0), 2)   # green boundary
+    return roi
+
+# ===============================
+# FAT MAP INSIDE LIVER ONLY
+# ===============================
+def create_fat_heatmap(image, liver_mask):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    overlay = image.copy()
+
+    # Liver pixels only
+    liver_pixels = gray[liver_mask == 1]
+
+    if liver_pixels.size == 0:
+        return overlay
+
+    # Example threshold rule for demo visualization
+    # lower intensity in liver can indicate fat-like darker areas in plain CT
+    threshold = np.percentile(liver_pixels, 40)
+
+    fatty_region = np.zeros_like(gray, dtype=np.uint8)
+    fatty_region[(liver_mask == 1) & (gray <= threshold)] = 1
+
+    normal_region = np.zeros_like(gray, dtype=np.uint8)
+    normal_region[(liver_mask == 1) & (gray > threshold)] = 1
+
+    # Apply colors only inside liver
+    # Blue for normal liver
+    overlay[normal_region == 1] = (
+        0.6 * overlay[normal_region == 1] + 0.4 * np.array([255, 0, 0])
+    ).astype(np.uint8)
+
+    # Yellow for fatty areas
+    overlay[fatty_region == 1] = (
+        0.6 * overlay[fatty_region == 1] + 0.4 * np.array([0, 255, 255])
+    ).astype(np.uint8)
+
+    # draw liver boundary
+    contours, _ = cv2.findContours(
+        (liver_mask * 255).astype(np.uint8),
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+    cv2.drawContours(overlay, contours, -1, (0, 255, 0), 2)
+
+    return overlay
+
+# ===============================
+# HU CALCULATION
+# ===============================
 def calculate_mean_hu(image, mask):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     liver_pixels = gray[mask == 1]
@@ -66,13 +143,11 @@ def calculate_mean_hu(image, mask):
     if liver_pixels.size == 0:
         return 0.0
 
-    mean_hu = np.mean(liver_pixels)
-    return float(mean_hu)
+    return float(np.mean(liver_pixels))
 
 # ===============================
-# STAGE DETERMINATION
+# STAGE
 # ===============================
-
 def determine_stage(mean_hu):
     if mean_hu > 75:
         return "Normal Liver"
@@ -84,236 +159,91 @@ def determine_stage(mean_hu):
         return "Severe NAFLD"
 
 # ===============================
-# EXPLAINABLE AI TEXT
+# EXPLAINABLE TEXT
 # ===============================
-
-def get_explainable_text(diagnosis, stage, mean_hu):
+def generate_explainable_text(stage, diagnosis):
     if diagnosis == "Healthy Liver":
-        return (
-            "The AI model analyzed the CT image and did not detect significant "
-            "fat accumulation in the liver. The liver region appears within the "
-            "normal density range."
-        )
-
-    return (
-        f"The AI model detected features suggestive of fatty liver disease. "
-        f"The liver region was segmented first, and analysis was restricted to "
-        f"the segmented liver area. The mean liver density value is {round(mean_hu, 2)}, "
-        f"which corresponds to {stage}. In the heatmap, red regions indicate "
-        f"lower-density suspicious fatty areas, yellow indicates intermediate regions, "
-        f"and green indicates relatively normal liver tissue."
-    )
-
-# ===============================
-# SYMPTOMS TEXT
-# ===============================
-
-def get_symptoms_text(stage):
-    if stage == "Normal Liver":
-        return [
-            "No major symptoms expected",
-            "Early fatty liver may still be asymptomatic",
-            "Routine screening is recommended if risk factors are present"
-        ]
-    elif stage == "Mild NAFLD":
-        return [
-            "Often no symptoms in early stage",
-            "Mild fatigue",
-            "General weakness",
-            "Mild abdominal discomfort"
-        ]
-    elif stage == "Moderate NAFLD":
-        return [
+        explain = "The model did not detect significant fatty infiltration in the liver region."
+        symptoms = ["Usually no major liver-related symptoms", "General health monitoring is advised"]
+        remedies = ["Maintain balanced diet", "Exercise regularly", "Avoid alcohol and junk food"]
+    else:
+        explain = f"The model detected fatty liver changes in the segmented liver region. The highlighted yellow regions indicate suspected fatty infiltration, while blue regions indicate comparatively normal liver tissue. Stage detected: {stage}."
+        symptoms = [
             "Fatigue",
-            "Upper right abdominal discomfort",
-            "Weakness",
-            "Reduced physical activity tolerance"
+            "Upper abdominal discomfort",
+            "Mild liver enlargement",
+            "Often asymptomatic in early stages"
         ]
-    else:
-        return [
-            "Persistent fatigue",
-            "Abdominal discomfort",
-            "Weakness",
-            "Possible metabolic risk association",
-            "Medical consultation is strongly recommended"
-        ]
-
-# ===============================
-# REMEDIES TEXT
-# ===============================
-
-def get_remedies_text(stage):
-    if stage == "Normal Liver":
-        return [
-            "Maintain a balanced diet",
-            "Exercise regularly",
-            "Continue periodic health checkups"
-        ]
-    elif stage == "Mild NAFLD":
-        return [
+        remedies = [
             "Reduce oily and sugary foods",
-            "Exercise regularly",
-            "Maintain healthy body weight",
-            "Avoid alcohol"
-        ]
-    elif stage == "Moderate NAFLD":
-        return [
-            "Follow a low-fat and low-sugar diet",
-            "Increase physical activity",
-            "Weight reduction is recommended",
-            "Avoid alcohol and junk food",
-            "Consult a doctor for further evaluation"
-        ]
-    else:
-        return [
-            "Immediate medical consultation is recommended",
-            "Strict dietary modification is needed",
-            "Avoid alcohol completely",
-            "Weight management is essential",
-            "Regular liver monitoring is recommended"
+            "Exercise daily",
+            "Weight management",
+            "Regular liver checkup",
+            "Consult doctor for clinical confirmation"
         ]
 
-# ===============================
-# GENERATE LIVER ROI
-# ===============================
-
-def generate_roi(image, mask):
-    roi = image.copy()
-    roi[mask == 0] = 0
-    return roi
+    return explain, symptoms, remedies
 
 # ===============================
-# GENERATE FAT-AWARE HEATMAP
+# API
 # ===============================
-
-def generate_fatty_liver_heatmap(image, mask):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    liver_pixels = gray[mask == 1]
-
-    if liver_pixels.size == 0:
-        return np.zeros_like(image)
-
-    min_val = np.min(liver_pixels)
-    max_val = np.max(liver_pixels)
-
-    if max_val - min_val == 0:
-        norm_gray = gray.copy()
-    else:
-        norm_gray = ((gray - min_val) / (max_val - min_val) * 255).astype(np.uint8)
-
-    heatmap = np.zeros((image.shape[0], image.shape[1], 3), dtype=np.uint8)
-
-    # Only inside liver mask
-    fatty_region = (mask == 1) & (norm_gray < 85)
-    moderate_region = (mask == 1) & (norm_gray >= 85) & (norm_gray < 170)
-    normal_region = (mask == 1) & (norm_gray >= 170)
-
-    # BGR colors for OpenCV
-    heatmap[fatty_region] = [0, 0, 255]       # Red
-    heatmap[moderate_region] = [0, 255, 255]  # Yellow
-    heatmap[normal_region] = [0, 255, 0]      # Green
-
-    overlay = cv2.addWeighted(image, 0.65, heatmap, 0.35, 0)
-    return overlay
-
-# ===============================
-# PREDICTION API
-# ===============================
-
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    try:
-        contents = await file.read()
-        image = np.array(Image.open(io.BytesIO(contents)).convert("RGB"))
+    contents = await file.read()
+    image = np.array(Image.open(io.BytesIO(contents)).convert("RGB"))
+    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
-        # ===============================
-        # CNN PREDICTION
-        # ===============================
-        cnn_img = preprocess_cnn(image)
-        cnn_interpreter.set_tensor(cnn_input[0]["index"], cnn_img)
-        cnn_interpreter.invoke()
-        prob = float(cnn_interpreter.get_tensor(cnn_output[0]["index"])[0][0])
+    # CNN classification
+    cnn_img = preprocess_cnn(image)
+    cnn_interpreter.set_tensor(cnn_input[0]['index'], cnn_img)
+    cnn_interpreter.invoke()
+    prob = float(cnn_interpreter.get_tensor(cnn_output[0]['index'])[0][0])
 
-        # ===============================
-        # HEALTHY CASE
-        # ===============================
-        if prob < 0.5:
-            stage = "Normal Liver"
-
-            return {
-                "Diagnosis": "Healthy Liver",
-                "Probability": round(prob, 6),
-                "Mean_HU": None,
-                "Stage": stage,
-                "Segmentation_Mask": None,
-                "ROI_Image": None,
-                "Heatmap_Image": None,
-                "Explainable_AI": get_explainable_text("Healthy Liver", stage, 0.0),
-                "Symptoms": get_symptoms_text(stage),
-                "Remedies": get_remedies_text(stage),
-                "Status": "Success"
-            }
-
-        # ===============================
-        # U-NET SEGMENTATION
-        # ===============================
-        unet_img = preprocess_unet(image)
-        unet_interpreter.set_tensor(unet_input[0]["index"], unet_img)
-        unet_interpreter.invoke()
-
-        mask = unet_interpreter.get_tensor(unet_output[0]["index"])[0, :, :, 0]
-        mask = (mask > 0.5).astype(np.uint8)
-
-        mask_resized = cv2.resize(
-            mask,
-            (image.shape[1], image.shape[0]),
-            interpolation=cv2.INTER_NEAREST
-        )
-
-        # ===============================
-        # ROI
-        # ===============================
-        roi = generate_roi(image, mask_resized)
-
-        # ===============================
-        # HEATMAP
-        # ===============================
-        overlay = generate_fatty_liver_heatmap(image, mask_resized)
-
-        # ===============================
-        # MEAN HU + STAGE
-        # ===============================
-        mean_hu = calculate_mean_hu(image, mask_resized)
-        stage = determine_stage(mean_hu)
-
-        # ===============================
-        # API RESPONSE
-        # ===============================
+    # Healthy case
+    if prob < 0.5:
+        explain, symptoms, remedies = generate_explainable_text("Normal Liver", "Healthy Liver")
         return {
-            "Diagnosis": "NAFLD",
+            "Diagnosis": "Healthy Liver",
             "Probability": round(prob, 6),
-            "Mean_HU": round(mean_hu, 2),
-            "Stage": stage,
-            "Segmentation_Mask": encode(mask_resized * 255),
-            "ROI_Image": encode(roi),
-            "Heatmap_Image": encode(overlay),
-            "Explainable_AI": get_explainable_text("NAFLD", stage, mean_hu),
-            "Symptoms": get_symptoms_text(stage),
-            "Remedies": get_remedies_text(stage),
+            "Mean_HU": None,
+            "Stage": "Normal Liver",
+            "ROI_Image": None,
+            "Heatmap_Image": None,
+            "Segmentation_Mask": None,
+            "Explainable_AI": explain,
+            "Symptoms": symptoms,
+            "Remedies": remedies,
             "Status": "Success"
         }
 
-    except Exception as e:
-        return {
-            "Diagnosis": "Error",
-            "Probability": 0.0,
-            "Mean_HU": None,
-            "Stage": "Unknown",
-            "Segmentation_Mask": None,
-            "ROI_Image": None,
-            "Heatmap_Image": None,
-            "Explainable_AI": "Prediction failed.",
-            "Symptoms": [],
-            "Remedies": [],
-            "Status": f"Failed: {str(e)}"
-        }
+    # U-Net segmentation
+    unet_img = preprocess_unet(image)
+    unet_interpreter.set_tensor(unet_input[0]['index'], unet_img)
+    unet_interpreter.invoke()
+    raw_mask = unet_interpreter.get_tensor(unet_output[0]['index'])[0, :, :, 0]
+
+    liver_mask = clean_liver_mask(raw_mask, image.shape)
+
+    # outputs
+    roi = create_roi_with_boundary(image, liver_mask)
+    heatmap = create_fat_heatmap(image, liver_mask)
+    segmentation_mask = (liver_mask * 255).astype(np.uint8)
+
+    mean_hu = calculate_mean_hu(image, liver_mask)
+    stage = determine_stage(mean_hu)
+
+    explain, symptoms, remedies = generate_explainable_text(stage, "NAFLD")
+
+    return {
+        "Diagnosis": "NAFLD",
+        "Probability": round(prob, 6),
+        "Mean_HU": round(mean_hu, 2),
+        "Stage": stage,
+        "ROI_Image": encode(roi),
+        "Heatmap_Image": encode(heatmap),
+        "Segmentation_Mask": encode(segmentation_mask),
+        "Explainable_AI": explain,
+        "Symptoms": symptoms,
+        "Remedies": remedies,
+        "Status": "Success"
+    }
