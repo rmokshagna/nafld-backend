@@ -1,0 +1,1 @@
+pip install tensorflow nibabel opencv-python scikit-learn matplotlib numpy
