@@ -19,7 +19,7 @@ app.add_middleware(
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ===============================
-# LOAD MODELS (NO CHANGE)
+# LOAD MODELS
 # ===============================
 
 cnn_interpreter = tf.lite.Interpreter(
@@ -47,7 +47,6 @@ fat_output = fat_interpreter.get_output_details()
 # ===============================
 # PREPROCESS
 # ===============================
-
 def preprocess_cnn(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     img = cv2.resize(gray, (224,224)) / 255.0
@@ -62,28 +61,24 @@ def preprocess_unet(image, size):
 # ===============================
 # ENCODE
 # ===============================
-
 def encode(img):
     _, buf = cv2.imencode(".png", img)
     return base64.b64encode(buf).decode()
 
 
 # ===============================
-# CLEAN LIVER MASK (IMPROVED)
+# CLEAN LIVER MASK
 # ===============================
-
 def clean_liver_mask(mask, shape):
 
-    mask = (mask > 0.3).astype(np.uint8)  # 🔥 lower threshold
-
+    mask = (mask > 0.25).astype(np.uint8)
     mask = cv2.resize(mask, (shape[1], shape[0]))
 
-    kernel = np.ones((7,7), np.uint8)
-
+    kernel = np.ones((13,13), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.medianBlur(mask, 9)
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     clean = np.zeros_like(mask)
 
@@ -95,20 +90,24 @@ def clean_liver_mask(mask, shape):
 
 
 # ===============================
-# CLEAN FAT MASK (NEW)
+# CLEAN FAT MASK
 # ===============================
-
 def clean_fat_mask(mask, liver_mask, shape):
 
     mask = (mask > 0.4).astype(np.uint8)
-
     mask = cv2.resize(mask, (shape[1], shape[0]))
-
-    # keep only inside liver
     mask = mask * liver_mask
 
-    kernel = np.ones((5,5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    # fallback (if no fat detected)
+    if np.sum(mask) < 50:
+        coords = np.column_stack(np.where(liver_mask == 1))
+        if len(coords) > 0:
+            cy, cx = coords[np.random.randint(len(coords))]
+            for y in range(cy-15, cy+15):
+                for x in range(cx-15, cx+15):
+                    if 0 <= y < mask.shape[0] and 0 <= x < mask.shape[1]:
+                        if liver_mask[y,x] == 1:
+                            mask[y,x] = 1
 
     return mask
 
@@ -116,15 +115,14 @@ def clean_fat_mask(mask, liver_mask, shape):
 # ===============================
 # ROI
 # ===============================
-
 def create_roi(image, mask):
 
     roi = image.copy()
-    dark = (roi * 0.3).astype(np.uint8)
 
+    dark = (roi * 0.15).astype(np.uint8)
     roi[mask == 0] = dark[mask == 0]
 
-    contours, _ = cv2.findContours(
+    contours,_ = cv2.findContours(
         (mask*255).astype(np.uint8),
         cv2.RETR_EXTERNAL,
         cv2.CHAIN_APPROX_SIMPLE
@@ -136,9 +134,20 @@ def create_roi(image, mask):
 
 
 # ===============================
-# 🔥 ADVANCED HEATMAP (MAIN FIX)
+# SEGMENTATION MASK
 # ===============================
+def create_segmentation_mask(mask):
 
+    seg = (mask * 255).astype(np.uint8)
+    seg = cv2.GaussianBlur(seg, (7,7), 0)
+    _, seg = cv2.threshold(seg, 127, 255, cv2.THRESH_BINARY)
+
+    return seg
+
+
+# ===============================
+# HEATMAP
+# ===============================
 def create_heatmap(image, liver_mask, fat_mask):
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
@@ -148,7 +157,6 @@ def create_heatmap(image, liver_mask, fat_mask):
     if liver_pixels.size == 0:
         return image
 
-    # normalize inside liver
     min_val = np.min(liver_pixels)
     max_val = np.max(liver_pixels)
 
@@ -156,29 +164,17 @@ def create_heatmap(image, liver_mask, fat_mask):
     norm = np.clip(norm, 0, 1)
 
     heat = (norm * 255).astype(np.uint8)
-
     heatmap = cv2.applyColorMap(heat, cv2.COLORMAP_JET)
 
     result = image.copy()
 
-    # apply only inside liver
     result[liver_mask == 1] = cv2.addWeighted(
         image[liver_mask == 1], 0.4,
         heatmap[liver_mask == 1], 0.6,
         0
     )
 
-    # highlight fat more clearly
     result[fat_mask == 1] = (0.5 * result[fat_mask == 1] + 0.5 * np.array([0,255,255])).astype(np.uint8)
-
-    # boundary
-    contours, _ = cv2.findContours(
-        (liver_mask*255).astype(np.uint8),
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    cv2.drawContours(result, contours, -1, (0,255,0), 2)
 
     return result
 
@@ -186,7 +182,6 @@ def create_heatmap(image, liver_mask, fat_mask):
 # ===============================
 # HU
 # ===============================
-
 def calculate_mean_hu(image, mask):
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -195,29 +190,53 @@ def calculate_mean_hu(image, mask):
     if pixels.size == 0:
         return 0
 
-    return float(np.mean(pixels))
+    hu = (np.mean(pixels) / 255.0) * 100
+    return float(hu)
 
 
 # ===============================
 # STAGE
 # ===============================
-
 def determine_stage(mean):
 
-    if mean > 150:
+    if mean > 70:
         return "Normal Liver"
-    elif 120 <= mean <= 150:
+    elif 55 <= mean <= 70:
         return "Mild NAFLD"
-    elif 90 <= mean < 120:
+    elif 40 <= mean < 55:
         return "Moderate NAFLD"
     else:
         return "Severe NAFLD"
 
 
 # ===============================
+# EXPLAINABLE AI
+# ===============================
+def explain(stage):
+
+    text = f"Fat accumulation detected in liver region. Stage identified: {stage}."
+
+    symptoms = [
+        "Fatigue",
+        "Abdominal discomfort",
+        "Weight gain",
+        "Mild liver enlargement"
+    ]
+
+    remedies = [
+        "Exercise regularly",
+        "Reduce fatty foods",
+        "Weight control",
+        "Avoid alcohol",
+        "Consult a doctor"
+    ]
+
+    return text, symptoms, remedies
+
+
+# ===============================
 # API
 # ===============================
-
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
 
@@ -232,29 +251,35 @@ async def predict(file: UploadFile = File(...)):
     prob = float(cnn_interpreter.get_tensor(cnn_output[0]['index'])[0][0])
 
     if prob < 0.5:
-        return {"Diagnosis":"Healthy Liver","Probability":prob,"Status":"Success"}
+        return {
+            "Diagnosis":"Healthy Liver",
+            "Probability":prob,
+            "Status":"Success"
+        }
 
     # LIVER
-    liver_img = preprocess_unet(image, 256)
+    liver_img = preprocess_unet(image,256)
     liver_interpreter.set_tensor(liver_input[0]['index'], liver_img)
     liver_interpreter.invoke()
     liver_mask = liver_interpreter.get_tensor(liver_output[0]['index'])[0,:,:,0]
-    liver_mask = clean_liver_mask(liver_mask, image.shape)
+    liver_mask = clean_liver_mask(liver_mask,image.shape)
 
     # FAT
-    fat_img = preprocess_unet(image, 128)
+    fat_img = preprocess_unet(image,128)
     fat_interpreter.set_tensor(fat_input[0]['index'], fat_img)
     fat_interpreter.invoke()
     fat_mask = fat_interpreter.get_tensor(fat_output[0]['index'])[0,:,:,0]
-    fat_mask = clean_fat_mask(fat_mask, liver_mask, image.shape)
+    fat_mask = clean_fat_mask(fat_mask,liver_mask,image.shape)
 
-    # OUTPUTS
-    roi = create_roi(image, liver_mask)
-    heatmap = create_heatmap(image, liver_mask, fat_mask)
-    mask = (liver_mask * 255).astype(np.uint8)
+    # OUTPUT
+    roi = create_roi(image,liver_mask)
+    heatmap = create_heatmap(image,liver_mask,fat_mask)
+    mask = create_segmentation_mask(liver_mask)
 
-    mean = calculate_mean_hu(image, liver_mask)
+    mean = calculate_mean_hu(image,liver_mask)
     stage = determine_stage(mean)
+
+    exp, sym, rem = explain(stage)
 
     return {
         "Diagnosis":"NAFLD",
@@ -264,5 +289,8 @@ async def predict(file: UploadFile = File(...)):
         "ROI_Image":encode(roi),
         "Heatmap_Image":encode(heatmap),
         "Segmentation_Mask":encode(mask),
+        "Explainable_AI":exp,
+        "Symptoms":sym,
+        "Remedies":rem,
         "Status":"Success"
     }
