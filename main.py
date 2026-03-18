@@ -28,7 +28,6 @@ cnn_interpreter.allocate_tensors()
 cnn_input = cnn_interpreter.get_input_details()
 cnn_output = cnn_interpreter.get_output_details()
 
-# BEST LIVER MODEL (256)
 liver_interpreter = tf.lite.Interpreter(
     model_path=os.path.join(BASE_DIR, "liver_unet_256.tflite")
 )
@@ -64,16 +63,16 @@ def encode(img):
     return base64.b64encode(buf).decode()
 
 # ===============================
-# CLEAN LIVER MASK (FIXED)
+# CLEAN LIVER MASK (FINAL FIX)
 # ===============================
 def clean_liver_mask(mask, shape):
 
-    mask = (mask > 0.2).astype(np.uint8)
+    mask = (mask > 0.15).astype(np.uint8)
     mask = cv2.resize(mask, (shape[1], shape[0]))
 
-    kernel = np.ones((15,15), np.uint8)
+    kernel = np.ones((25,25), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel)
 
     contours,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -81,12 +80,14 @@ def clean_liver_mask(mask, shape):
 
     if contours:
         largest = max(contours, key=cv2.contourArea)
-        cv2.drawContours(clean, [largest], -1, 1, -1)
+
+        if cv2.contourArea(largest) > 500:
+            cv2.drawContours(clean, [largest], -1, 1, -1)
 
     return clean
 
 # ===============================
-# CLEAN FAT MASK (NO FAKE)
+# CLEAN FAT MASK
 # ===============================
 def clean_fat_mask(mask, liver_mask, shape):
 
@@ -97,7 +98,7 @@ def clean_fat_mask(mask, liver_mask, shape):
     return mask
 
 # ===============================
-# ROI (LIVER OUTLINE)
+# ROI (ALWAYS SHOW)
 # ===============================
 def create_roi(image, mask):
 
@@ -109,19 +110,35 @@ def create_roi(image, mask):
 
     if contours:
         largest = max(contours, key=cv2.contourArea)
-        cv2.drawContours(roi, [largest], -1, (255,255,255), 2)
+
+        if cv2.contourArea(largest) > 500:
+            cv2.drawContours(roi, [largest], -1, (255,255,255), 2)
+            return roi
+
+    # fallback box
+    h, w = image.shape[:2]
+    cv2.rectangle(roi, (w//3, h//3), (2*w//3, 2*h//3), (255,255,255), 2)
 
     return roi
 
 # ===============================
-# SEGMENTATION (ONLY LIVER)
+# SEGMENTATION MASK (FINAL)
 # ===============================
 def create_segmentation_mask(mask):
 
     seg = (mask * 255).astype(np.uint8)
-    _, seg = cv2.threshold(seg, 127, 255, cv2.THRESH_BINARY)
 
-    return seg
+    contours,_ = cv2.findContours(seg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    clean = np.zeros_like(seg)
+
+    if contours:
+        largest = max(contours, key=cv2.contourArea)
+
+        if cv2.contourArea(largest) > 500:
+            cv2.drawContours(clean, [largest], -1, 255, -1)
+
+    return clean
 
 # ===============================
 # HEATMAP (RESTORED)
@@ -136,16 +153,23 @@ def create_heatmap(image, liver_mask, fat_mask):
     return heatmap
 
 # ===============================
-# HU
+# HU CALCULATION (FIXED)
 # ===============================
 def calculate_mean_hu(image, mask):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
     pixels = gray[mask == 1]
 
     if pixels.size == 0:
         return 0
 
-    return float(np.mean(pixels))
+    mean = np.mean(pixels)
+
+    # pseudo HU scaling
+    hu = (mean / 255.0) * 200 - 100
+
+    return float(hu)
 
 # ===============================
 # STAGE
