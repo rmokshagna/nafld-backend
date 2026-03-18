@@ -80,7 +80,6 @@ def clean_liver_mask(mask, shape):
 
     if contours:
         largest = max(contours, key=cv2.contourArea)
-
         if cv2.contourArea(largest) > 500:
             cv2.drawContours(clean, [largest], -1, 1, -1)
 
@@ -98,7 +97,7 @@ def clean_fat_mask(mask, liver_mask, shape):
     return mask
 
 # ===============================
-# ROI (ALWAYS SHOW)
+# ROI (UNCHANGED)
 # ===============================
 def create_roi(image, mask):
 
@@ -115,14 +114,13 @@ def create_roi(image, mask):
             cv2.drawContours(roi, [largest], -1, (255,255,255), 2)
             return roi
 
-    # fallback box
     h, w = image.shape[:2]
     cv2.rectangle(roi, (w//3, h//3), (2*w//3, 2*h//3), (255,255,255), 2)
 
     return roi
 
 # ===============================
-# SEGMENTATION MASK
+# SEGMENTATION (UNCHANGED)
 # ===============================
 def create_segmentation_mask(mask):
 
@@ -141,56 +139,44 @@ def create_segmentation_mask(mask):
     return clean
 
 # ===============================
-# HEATMAP (FINAL)
+# HEATMAP (FINAL PERFECT VERSION)
 # ===============================
 def create_heatmap(image, liver_mask, fat_mask):
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
+    # FULL IMAGE HEATMAP
+    norm = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+    heatmap = cv2.applyColorMap(norm.astype(np.uint8), cv2.COLORMAP_JET)
+
+    result = heatmap.copy()
+
+    # ONLY SMALL FAT REGIONS INSIDE LIVER
     liver_pixels = gray[liver_mask == 1]
 
     if liver_pixels.size == 0:
-        return image
+        return result
 
-    min_val = np.min(liver_pixels)
-    max_val = np.max(liver_pixels)
+    thresh_val = np.percentile(liver_pixels, 75)
 
-    norm = (gray - min_val) / (max_val - min_val + 1e-5)
-    norm = np.clip(norm, 0, 1)
+    fat_region = (gray > thresh_val).astype(np.uint8)
+    fat_region = fat_region * liver_mask
 
-    heat = (norm * 255).astype(np.uint8)
-    heatmap = cv2.applyColorMap(heat, cv2.COLORMAP_JET)
+    kernel = np.ones((7,7), np.uint8)
+    fat_region = cv2.morphologyEx(fat_region, cv2.MORPH_OPEN, kernel)
+    fat_region = cv2.GaussianBlur(fat_region.astype(np.float32), (9,9), 0)
 
-    result = image.copy()
+    fat_region = (fat_region > 0.2).astype(np.uint8)
 
-    result[liver_mask == 1] = cv2.addWeighted(
-        image[liver_mask == 1], 0.4,
-        heatmap[liver_mask == 1], 0.6,
-        0
-    )
+    overlay = result.copy()
+    overlay[fat_region == 1] = [0,255,255]
 
-    # FAT highlight
-    if np.sum(fat_mask) > 50:
-        result[fat_mask == 1] = (
-            0.5 * result[fat_mask == 1] +
-            0.5 * np.array([0,255,255])
-        ).astype(np.uint8)
-
-    else:
-        coords = np.column_stack(np.where(liver_mask == 1))
-
-        if len(coords) > 0:
-            cy, cx = coords[np.random.randint(len(coords))]
-
-            temp = result.copy()
-            cv2.circle(temp, (cx, cy), 20, (0,255,255), -1)
-
-            result = cv2.addWeighted(result, 0.85, temp, 0.15, 0)
+    result = cv2.addWeighted(result, 0.85, overlay, 0.15, 0)
 
     return result
 
 # ===============================
-# HU (OLD LOGIC RESTORED)
+# HU (OLD CORRECT LOGIC)
 # ===============================
 def calculate_mean_hu(image, mask):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
