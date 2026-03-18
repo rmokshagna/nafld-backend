@@ -28,21 +28,13 @@ cnn_interpreter.allocate_tensors()
 cnn_input = cnn_interpreter.get_input_details()
 cnn_output = cnn_interpreter.get_output_details()
 
-liver_interpreter = tf.lite.Interpreter(
-    model_path=os.path.join(BASE_DIR, "unet_fat_segmentation_quant.tflite")
-)
-liver_interpreter.allocate_tensors()
-liver_input = liver_interpreter.get_input_details()
-liver_output = liver_interpreter.get_output_details()
-
-# NEW BEST MODEL (USE THIS)
+# ✅ USE BEST 256 MODEL
 new_liver_interpreter = tf.lite.Interpreter(
     model_path=os.path.join(BASE_DIR, "liver_unet_256.tflite")
 )
 new_liver_interpreter.allocate_tensors()
 new_liver_input = new_liver_interpreter.get_input_details()
 new_liver_output = new_liver_interpreter.get_output_details()
-
 
 fat_interpreter = tf.lite.Interpreter(
     model_path=os.path.join(BASE_DIR, "fatty_liver_unet.tflite")
@@ -93,7 +85,7 @@ def clean_liver_mask(mask, shape):
     return clean
 
 # ===============================
-# CLEAN FAT MASK
+# CLEAN FAT MASK (FIXED)
 # ===============================
 def clean_fat_mask(mask, liver_mask, shape):
 
@@ -101,48 +93,37 @@ def clean_fat_mask(mask, liver_mask, shape):
     mask = cv2.resize(mask, (shape[1], shape[0]))
     mask = mask * liver_mask
 
-    # remove square artifact → ellipse
-    if np.sum(mask) < 100:
-        coords = np.column_stack(np.where(liver_mask == 1))
-        if len(coords) > 0:
-            cy, cx = coords[np.random.randint(len(coords))]
-            temp = np.zeros_like(mask)
-            cv2.ellipse(temp, (cx, cy), (30, 20), 0, 0, 360, 1, -1)
-            mask = temp * liver_mask
-
     return mask
 
 # ===============================
-# ROI (CROPPED LIVER)
+# ROI WITH BOUNDARY (FIXED)
 # ===============================
 def create_roi(image, mask):
 
-    coords = np.column_stack(np.where(mask == 1))
+    roi = image.copy()
 
-    if len(coords) == 0:
-        return image
+    contours,_ = cv2.findContours(mask.astype(np.uint8),
+                                  cv2.RETR_EXTERNAL,
+                                  cv2.CHAIN_APPROX_SIMPLE)
 
-    y_min, x_min = coords.min(axis=0)
-    y_max, x_max = coords.max(axis=0)
-
-    pad = 10
-    y_min = max(y_min - pad, 0)
-    x_min = max(x_min - pad, 0)
-    y_max = min(y_max + pad, image.shape[0])
-    x_max = min(x_max + pad, image.shape[1])
-
-    roi = image[y_min:y_max, x_min:x_max]
+    cv2.drawContours(roi, contours, -1, (255,255,255), 2)
 
     return roi
 
 # ===============================
-# SEGMENTATION MASK
+# SEGMENTATION MASK (FIXED)
 # ===============================
 def create_segmentation_mask(mask):
-    return (mask * 255).astype(np.uint8)
+
+    seg = (mask * 255).astype(np.uint8)
+
+    seg = cv2.GaussianBlur(seg, (7,7), 0)
+    _, seg = cv2.threshold(seg, 127, 255, cv2.THRESH_BINARY)
+
+    return seg
 
 # ===============================
-# HEATMAP (UNCHANGED)
+# HEATMAP (IMPROVED)
 # ===============================
 def create_heatmap(image, liver_mask, fat_mask):
 
@@ -170,12 +151,16 @@ def create_heatmap(image, liver_mask, fat_mask):
         0
     )
 
-    result[fat_mask == 1] = (0.5 * result[fat_mask == 1] + 0.5 * np.array([0,255,255])).astype(np.uint8)
+    # ✅ subtle fat highlight (no fake circle)
+    overlay = result.copy()
+    overlay[fat_mask == 1] = [0, 200, 255]
+
+    result = cv2.addWeighted(result, 0.85, overlay, 0.15, 0)
 
     return result
 
 # ===============================
-# HU (UNCHANGED)
+# HU
 # ===============================
 def calculate_mean_hu(image, mask):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -201,7 +186,7 @@ def determine_stage(mean):
         return "Severe NAFLD"
 
 # ===============================
-# EXPLAINABLE AI
+# EXPLAINABLE AI (UNCHANGED)
 # ===============================
 def explain_all(diagnosis, stage, mean):
 
@@ -223,7 +208,6 @@ def explain_all(diagnosis, stage, mean):
             f"The liver region was segmented using a deep learning U-Net model. "
             f"Fat accumulation was identified based on pixel intensity variations. "
             f"The mean HU value is {round(mean,2)}, corresponding to {stage}. "
-            
         )
 
         symptoms = [
@@ -269,11 +253,11 @@ async def predict(file: UploadFile = File(...)):
             "Remedies":rem
         }
 
-    # LIVER
+    # LIVER (256 MODEL USED)
     liver_img = preprocess_unet(image,256)
-    liver_interpreter.set_tensor(liver_input[0]['index'], liver_img)
-    liver_interpreter.invoke()
-    liver_mask = liver_interpreter.get_tensor(liver_output[0]['index'])[0,:,:,0]
+    new_liver_interpreter.set_tensor(new_liver_input[0]['index'], liver_img)
+    new_liver_interpreter.invoke()
+    liver_mask = new_liver_interpreter.get_tensor(new_liver_output[0]['index'])[0,:,:,0]
     liver_mask = clean_liver_mask(liver_mask,image.shape)
 
     # FAT
