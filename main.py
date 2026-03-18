@@ -191,11 +191,11 @@ def calculate_mean_hu(image, mask):
 # ===============================
 def determine_stage(mean):
 
-    if mean > 75:
+    if mean > 55:
         return "Normal Liver"
-    elif 60 <= mean <= 75:
+    elif 55 <= mean <= 45:
         return "Mild NAFLD"
-    elif 45 <= mean < 60:
+    elif 35 <= mean < 45:
         return "Moderate NAFLD"
     else:
         return "Severe NAFLD"
