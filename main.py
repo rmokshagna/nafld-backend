@@ -223,7 +223,7 @@ def explain_all(diagnosis, stage, mean):
             f"The liver region was segmented using a deep learning U-Net model. "
             f"Fat accumulation was identified based on pixel intensity variations. "
             f"The mean HU value is {round(mean,2)}, corresponding to {stage}. "
-            "Yellow regions indicate fatty areas and blue regions indicate normal liver tissue."
+            
         )
 
         symptoms = [
