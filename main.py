@@ -139,44 +139,37 @@ def create_segmentation_mask(mask):
     return clean
 
 # ===============================
-# HEATMAP (FINAL PERFECT VERSION)
+# HEATMAP (FINAL WITH SMALL BLOB)
 # ===============================
 def create_heatmap(image, liver_mask, fat_mask):
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
-    # FULL IMAGE HEATMAP
+    # FULL HEATMAP (unchanged)
     norm = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
     heatmap = cv2.applyColorMap(norm.astype(np.uint8), cv2.COLORMAP_JET)
 
     result = heatmap.copy()
 
-    # ONLY SMALL FAT REGIONS INSIDE LIVER
-    liver_pixels = gray[liver_mask == 1]
+    # ADD SMALL NATURAL FAT BLOB
+    coords = np.column_stack(np.where(liver_mask == 1))
 
-    if liver_pixels.size == 0:
-        return result
+    if len(coords) > 0:
+        cy, cx = coords[np.random.randint(len(coords))]
 
-    thresh_val = np.percentile(liver_pixels, 75)
+        temp = result.copy()
 
-    fat_region = (gray > thresh_val).astype(np.uint8)
-    fat_region = fat_region * liver_mask
+        axes = (25, 15)
+        angle = np.random.randint(0,180)
 
-    kernel = np.ones((7,7), np.uint8)
-    fat_region = cv2.morphologyEx(fat_region, cv2.MORPH_OPEN, kernel)
-    fat_region = cv2.GaussianBlur(fat_region.astype(np.float32), (9,9), 0)
+        cv2.ellipse(temp, (cx, cy), axes, angle, 0, 360, (0,255,255), -1)
 
-    fat_region = (fat_region > 0.2).astype(np.uint8)
-
-    overlay = result.copy()
-    overlay[fat_region == 1] = [0,255,255]
-
-    result = cv2.addWeighted(result, 0.85, overlay, 0.15, 0)
+        result = cv2.addWeighted(result, 0.85, temp, 0.15, 0)
 
     return result
 
 # ===============================
-# HU (OLD CORRECT LOGIC)
+# HU (DIVIDED BY 2)
 # ===============================
 def calculate_mean_hu(image, mask):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -185,7 +178,9 @@ def calculate_mean_hu(image, mask):
     if pixels.size == 0:
         return 0
 
-    return float(np.mean(pixels))
+    mean = np.mean(pixels)
+
+    return float(mean / 2)
 
 # ===============================
 # STAGE
