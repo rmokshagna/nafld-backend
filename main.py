@@ -28,13 +28,13 @@ cnn_interpreter.allocate_tensors()
 cnn_input = cnn_interpreter.get_input_details()
 cnn_output = cnn_interpreter.get_output_details()
 
-# ✅ USE BEST 256 MODEL
-new_liver_interpreter = tf.lite.Interpreter(
+# BEST LIVER MODEL (256)
+liver_interpreter = tf.lite.Interpreter(
     model_path=os.path.join(BASE_DIR, "liver_unet_256.tflite")
 )
-new_liver_interpreter.allocate_tensors()
-new_liver_input = new_liver_interpreter.get_input_details()
-new_liver_output = new_liver_interpreter.get_output_details()
+liver_interpreter.allocate_tensors()
+liver_input = liver_interpreter.get_input_details()
+liver_output = liver_interpreter.get_output_details()
 
 fat_interpreter = tf.lite.Interpreter(
     model_path=os.path.join(BASE_DIR, "fatty_liver_unet.tflite")
@@ -64,15 +64,16 @@ def encode(img):
     return base64.b64encode(buf).decode()
 
 # ===============================
-# CLEAN LIVER MASK
+# CLEAN LIVER MASK (FIXED)
 # ===============================
 def clean_liver_mask(mask, shape):
 
-    mask = (mask > 0.3).astype(np.uint8)
+    mask = (mask > 0.2).astype(np.uint8)
     mask = cv2.resize(mask, (shape[1], shape[0]))
 
-    kernel = np.ones((25,25), np.uint8)
+    kernel = np.ones((15,15), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
     contours,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -85,7 +86,7 @@ def clean_liver_mask(mask, shape):
     return clean
 
 # ===============================
-# CLEAN FAT MASK (FIXED)
+# CLEAN FAT MASK (NO FAKE)
 # ===============================
 def clean_fat_mask(mask, liver_mask, shape):
 
@@ -96,7 +97,7 @@ def clean_fat_mask(mask, liver_mask, shape):
     return mask
 
 # ===============================
-# ROI WITH BOUNDARY (FIXED)
+# ROI (LIVER OUTLINE)
 # ===============================
 def create_roi(image, mask):
 
@@ -106,58 +107,33 @@ def create_roi(image, mask):
                                   cv2.RETR_EXTERNAL,
                                   cv2.CHAIN_APPROX_SIMPLE)
 
-    cv2.drawContours(roi, contours, -1, (255,255,255), 2)
+    if contours:
+        largest = max(contours, key=cv2.contourArea)
+        cv2.drawContours(roi, [largest], -1, (255,255,255), 2)
 
     return roi
 
 # ===============================
-# SEGMENTATION MASK (FIXED)
+# SEGMENTATION (ONLY LIVER)
 # ===============================
 def create_segmentation_mask(mask):
 
     seg = (mask * 255).astype(np.uint8)
-
-    seg = cv2.GaussianBlur(seg, (7,7), 0)
     _, seg = cv2.threshold(seg, 127, 255, cv2.THRESH_BINARY)
 
     return seg
 
 # ===============================
-# HEATMAP (IMPROVED)
+# HEATMAP (RESTORED)
 # ===============================
 def create_heatmap(image, liver_mask, fat_mask):
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
-    liver_pixels = gray[liver_mask == 1]
+    norm = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+    heatmap = cv2.applyColorMap(norm.astype(np.uint8), cv2.COLORMAP_JET)
 
-    if liver_pixels.size == 0:
-        return image
-
-    min_val = np.min(liver_pixels)
-    max_val = np.max(liver_pixels)
-
-    norm = (gray - min_val) / (max_val - min_val + 1e-5)
-    norm = np.clip(norm, 0, 1)
-
-    heat = (norm * 255).astype(np.uint8)
-    heatmap = cv2.applyColorMap(heat, cv2.COLORMAP_JET)
-
-    result = image.copy()
-
-    result[liver_mask == 1] = cv2.addWeighted(
-        image[liver_mask == 1], 0.4,
-        heatmap[liver_mask == 1], 0.6,
-        0
-    )
-
-    # ✅ subtle fat highlight (no fake circle)
-    overlay = result.copy()
-    overlay[fat_mask == 1] = [0, 200, 255]
-
-    result = cv2.addWeighted(result, 0.85, overlay, 0.15, 0)
-
-    return result
+    return heatmap
 
 # ===============================
 # HU
@@ -253,11 +229,11 @@ async def predict(file: UploadFile = File(...)):
             "Remedies":rem
         }
 
-    # LIVER (256 MODEL USED)
+    # LIVER
     liver_img = preprocess_unet(image,256)
-    new_liver_interpreter.set_tensor(new_liver_input[0]['index'], liver_img)
-    new_liver_interpreter.invoke()
-    liver_mask = new_liver_interpreter.get_tensor(new_liver_output[0]['index'])[0,:,:,0]
+    liver_interpreter.set_tensor(liver_input[0]['index'], liver_img)
+    liver_interpreter.invoke()
+    liver_mask = liver_interpreter.get_tensor(liver_output[0]['index'])[0,:,:,0]
     liver_mask = clean_liver_mask(liver_mask,image.shape)
 
     # FAT
