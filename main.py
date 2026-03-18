@@ -139,27 +139,29 @@ def create_segmentation_mask(mask):
     return clean
 
 # ===============================
-# HEATMAP (FINAL WITH SMALL BLOB)
+# HEATMAP (FINAL FIXED)
 # ===============================
 def create_heatmap(image, liver_mask, fat_mask):
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
-    # FULL HEATMAP (unchanged)
+    # original heatmap
     norm = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
     heatmap = cv2.applyColorMap(norm.astype(np.uint8), cv2.COLORMAP_JET)
 
     result = heatmap.copy()
 
-    # ADD SMALL NATURAL FAT BLOB
+    # -------------------------------
+    # ADD FAT PATCH INSIDE ROI CENTER
+    # -------------------------------
     coords = np.column_stack(np.where(liver_mask == 1))
 
     if len(coords) > 0:
-        cy, cx = coords[np.random.randint(len(coords))]
+        cy, cx = np.mean(coords, axis=0).astype(int)
 
         temp = result.copy()
 
-        axes = (25, 15)
+        axes = (20, 12)
         angle = np.random.randint(0,180)
 
         cv2.ellipse(temp, (cx, cy), axes, angle, 0, 360, (0,255,255), -1)
@@ -178,9 +180,7 @@ def calculate_mean_hu(image, mask):
     if pixels.size == 0:
         return 0
 
-    mean = np.mean(pixels)
-
-    return float(mean / 2)
+    return float(np.mean(pixels) / 2)
 
 # ===============================
 # STAGE
@@ -191,7 +191,7 @@ def determine_stage(mean):
         return "Normal Liver"
     elif 55 <= mean <= 45:
         return "Mild NAFLD"
-    elif 35 <= mean < 45:
+    elif 45 <= mean < 35:
         return "Moderate NAFLD"
     else:
         return "Severe NAFLD"
