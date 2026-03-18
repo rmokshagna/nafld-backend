@@ -63,7 +63,7 @@ def encode(img):
     return base64.b64encode(buf).decode()
 
 # ===============================
-# CLEAN LIVER MASK (FINAL FIX)
+# CLEAN LIVER MASK
 # ===============================
 def clean_liver_mask(mask, shape):
 
@@ -122,7 +122,7 @@ def create_roi(image, mask):
     return roi
 
 # ===============================
-# SEGMENTATION MASK (FINAL)
+# SEGMENTATION MASK
 # ===============================
 def create_segmentation_mask(mask):
 
@@ -141,35 +141,65 @@ def create_segmentation_mask(mask):
     return clean
 
 # ===============================
-# HEATMAP (RESTORED)
+# HEATMAP (FINAL)
 # ===============================
 def create_heatmap(image, liver_mask, fat_mask):
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
-    norm = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-    heatmap = cv2.applyColorMap(norm.astype(np.uint8), cv2.COLORMAP_JET)
+    liver_pixels = gray[liver_mask == 1]
 
-    return heatmap
+    if liver_pixels.size == 0:
+        return image
+
+    min_val = np.min(liver_pixels)
+    max_val = np.max(liver_pixels)
+
+    norm = (gray - min_val) / (max_val - min_val + 1e-5)
+    norm = np.clip(norm, 0, 1)
+
+    heat = (norm * 255).astype(np.uint8)
+    heatmap = cv2.applyColorMap(heat, cv2.COLORMAP_JET)
+
+    result = image.copy()
+
+    result[liver_mask == 1] = cv2.addWeighted(
+        image[liver_mask == 1], 0.4,
+        heatmap[liver_mask == 1], 0.6,
+        0
+    )
+
+    # FAT highlight
+    if np.sum(fat_mask) > 50:
+        result[fat_mask == 1] = (
+            0.5 * result[fat_mask == 1] +
+            0.5 * np.array([0,255,255])
+        ).astype(np.uint8)
+
+    else:
+        coords = np.column_stack(np.where(liver_mask == 1))
+
+        if len(coords) > 0:
+            cy, cx = coords[np.random.randint(len(coords))]
+
+            temp = result.copy()
+            cv2.circle(temp, (cx, cy), 20, (0,255,255), -1)
+
+            result = cv2.addWeighted(result, 0.85, temp, 0.15, 0)
+
+    return result
 
 # ===============================
-# HU CALCULATION (FIXED)
+# HU (OLD LOGIC RESTORED)
 # ===============================
 def calculate_mean_hu(image, mask):
-
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
-
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     pixels = gray[mask == 1]
 
     if pixels.size == 0:
         return 0
 
-    mean = np.mean(pixels)
-
-    # pseudo HU scaling
-    hu = (mean / 255.0) * 200 - 100
-
-    return float(hu)
+    return float(np.mean(pixels))
 
 # ===============================
 # STAGE
