@@ -164,9 +164,9 @@ def create_heatmap(image, liver_mask, fat_mask):
         axes = (20, 12)
         angle = np.random.randint(0,180)
 
-        cv2.ellipse(temp, (cx, cy), axes, angle, 0, 360, (0,255,255), -1)
+        cv2.ellipse(temp, (cx, cy), axes, angle, 0, 360, (0,200,255), -1)
 
-        result = cv2.addWeighted(result, 0.85, temp, 0.15, 0)
+        result = cv2.addWeighted(result, 0.75, temp, 0.25, 0)
 
     return result
 
@@ -189,9 +189,9 @@ def determine_stage(mean):
 
     if mean > 55:
         return "Normal Liver"
-    elif 55 <= mean <= 45:
+    elif 45 <= mean <= 55:
         return "Mild NAFLD"
-    elif 45 <= mean < 35:
+    elif 35 <= mean < 45:
         return "Moderate NAFLD"
     else:
         return "Severe NAFLD"
