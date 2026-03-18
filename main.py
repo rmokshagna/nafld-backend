@@ -28,13 +28,7 @@ cnn_interpreter.allocate_tensors()
 cnn_input = cnn_interpreter.get_input_details()
 cnn_output = cnn_interpreter.get_output_details()
 
-# OLD MODEL (kept as backup)
-liver_interpreter = tf.lite.Interpreter(
-    model_path=os.path.join(BASE_DIR, "unet_fat_segmentation_quant.tflite")
-)
-liver_interpreter.allocate_tensors()
-
-# NEW MODEL (MAIN ONE 🔥)
+# NEW BEST MODEL (USE THIS)
 new_liver_interpreter = tf.lite.Interpreter(
     model_path=os.path.join(BASE_DIR, "liver_unet_256.tflite")
 )
@@ -100,6 +94,7 @@ def clean_fat_mask(mask, liver_mask, shape):
     mask = cv2.resize(mask, (shape[1], shape[0]))
     mask = mask * liver_mask
 
+    # natural fallback (NO SQUARE)
     if np.sum(mask) < 100:
         coords = np.column_stack(np.where(liver_mask == 1))
         if len(coords) > 0:
@@ -111,7 +106,7 @@ def clean_fat_mask(mask, liver_mask, shape):
     return mask
 
 # ===============================
-# ROI (CROPPED)
+# ROI (FIXED)
 # ===============================
 def create_roi(image, mask):
 
@@ -132,17 +127,18 @@ def create_roi(image, mask):
     return image[y_min:y_max, x_min:x_max]
 
 # ===============================
-# SEGMENTATION MASK
+# SEGMENTATION MASK (FIXED)
 # ===============================
 def create_segmentation_mask(mask):
     return (mask * 255).astype(np.uint8)
 
 # ===============================
-# HEATMAP (UNCHANGED)
+# HEATMAP (KEEP YOUR WORKING VERSION)
 # ===============================
 def create_heatmap(image, liver_mask, fat_mask):
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
     liver_pixels = gray[liver_mask == 1]
 
     if liver_pixels.size == 0:
@@ -152,8 +148,9 @@ def create_heatmap(image, liver_mask, fat_mask):
     max_val = np.max(liver_pixels)
 
     norm = (gray - min_val) / (max_val - min_val + 1e-5)
-    heat = (norm * 255).astype(np.uint8)
+    norm = np.clip(norm, 0, 1)
 
+    heat = (norm * 255).astype(np.uint8)
     heatmap = cv2.applyColorMap(heat, cv2.COLORMAP_JET)
 
     result = image.copy()
@@ -171,16 +168,16 @@ def create_heatmap(image, liver_mask, fat_mask):
     return result
 
 # ===============================
-# HU (UNCHANGED)
+# HU (FROM YOUR 15/03 VERSION)
 # ===============================
 def calculate_mean_hu(image, mask):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    pixels = gray[mask == 1]
+    liver_pixels = gray[mask == 1]
 
-    if pixels.size == 0:
-        return 0
+    if liver_pixels.size == 0:
+        return 0.0
 
-    return float(np.mean(pixels))
+    return float(np.mean(liver_pixels))
 
 # ===============================
 # STAGE
@@ -199,32 +196,27 @@ def determine_stage(mean):
 # ===============================
 # EXPLAINABLE AI
 # ===============================
-def explain_all(diagnosis, stage, mean):
+def explain_all(stage, mean):
 
-    if diagnosis == "Healthy Liver":
+    explain = (
+        f"The liver region was segmented using U-Net. "
+        f"Pixel intensity analysis was performed inside the liver. "
+        f"Mean HU value is {round(mean,2)}, indicating {stage}. "
+        "Yellow regions show fatty areas, blue regions show normal tissue."
+    )
 
-        explain = (
-            f"The CT scan was analyzed and liver segmentation was performed. "
-            f"The mean HU value is {round(mean,2)}, which is within normal range. "
-            "No fatty infiltration detected."
-        )
+    symptoms = [
+        "Fatigue",
+        "Abdominal discomfort",
+        "Weight gain"
+    ]
 
-        symptoms = ["No symptoms", "Normal liver"]
-
-        remedies = ["Healthy diet", "Exercise", "Routine checkups"]
-
-    else:
-
-        explain = (
-            f"U-Net based segmentation identified the liver region. "
-            f"Fat accumulation detected using intensity variation. "
-            f"Mean HU value: {round(mean,2)} → {stage}. "
-            "Yellow = fat, Blue = normal liver."
-        )
-
-        symptoms = ["Fatigue", "Abdominal pain", "Weight gain"]
-
-        remedies = ["Diet control", "Exercise", "Avoid alcohol", "Consult doctor"]
+    remedies = [
+        "Healthy diet",
+        "Exercise",
+        "Avoid alcohol",
+        "Medical consultation"
+    ]
 
     return explain, symptoms, remedies
 
@@ -245,41 +237,35 @@ async def predict(file: UploadFile = File(...)):
     prob = float(cnn_interpreter.get_tensor(cnn_output[0]['index'])[0][0])
 
     if prob < 0.5:
-        exp, sym, rem = explain_all("Healthy Liver", "Normal", 0)
         return {
             "Diagnosis":"Healthy Liver",
             "Probability":prob,
-            "Explainable_AI":exp,
-            "Symptoms":sym,
-            "Remedies":rem,
             "Status":"Success"
         }
 
-    # 🔥 USE NEW MODEL HERE
+    # 🔥 NEW MODEL USED
     liver_img = preprocess_unet(image,256)
-
     new_liver_interpreter.set_tensor(new_liver_input[0]['index'], liver_img)
     new_liver_interpreter.invoke()
 
     liver_mask = new_liver_interpreter.get_tensor(new_liver_output[0]['index'])[0,:,:,0]
-    liver_mask = clean_liver_mask(liver_mask, image.shape)
+    liver_mask = clean_liver_mask(liver_mask,image.shape)
 
     # FAT
     fat_img = preprocess_unet(image,128)
     fat_interpreter.set_tensor(fat_input[0]['index'], fat_img)
     fat_interpreter.invoke()
     fat_mask = fat_interpreter.get_tensor(fat_output[0]['index'])[0,:,:,0]
-    fat_mask = clean_fat_mask(fat_mask, liver_mask, image.shape)
+    fat_mask = clean_fat_mask(fat_mask,liver_mask,image.shape)
 
-    # OUTPUT
-    roi = create_roi(image, liver_mask)
-    heatmap = create_heatmap(image, liver_mask, fat_mask)
+    roi = create_roi(image,liver_mask)
+    heatmap = create_heatmap(image,liver_mask,fat_mask)
     seg = create_segmentation_mask(liver_mask)
 
-    mean = calculate_mean_hu(image, liver_mask)
+    mean = calculate_mean_hu(image,liver_mask)
     stage = determine_stage(mean)
 
-    exp, sym, rem = explain_all("NAFLD", stage, mean)
+    exp, sym, rem = explain_all(stage, mean)
 
     return {
         "Diagnosis":"NAFLD",
