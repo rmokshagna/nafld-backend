@@ -97,32 +97,44 @@ def clean_fat_mask(mask, liver_mask, shape):
     return mask
 
 # ===============================
-# ROI (UNCHANGED)
-# ===============================
-# ===============================
-# ROI (FIXED - NO SMALL BOX)
+# ROI (FORCED FULL LIVER CONTOUR)
 # ===============================
 def create_roi(image, mask):
 
     roi = image.copy()
-
     mask = (mask > 0).astype(np.uint8)
 
-    # Fill holes → stronger mask
-    kernel = np.ones((15,15), np.uint8)
+    # -------------------------------
+    # STRONG MASK REFINEMENT
+    # -------------------------------
+    kernel = np.ones((25,25), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel)
+
+    # Fill holes
+    mask = cv2.medianBlur(mask, 11)
 
     contours,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     if contours:
         largest = max(contours, key=cv2.contourArea)
 
-        # draw ONLY if large enough
-        if cv2.contourArea(largest) > 2000:
-            cv2.drawContours(roi, [largest], -1, (255,255,255), 2)
-            return roi
+        # -------------------------------
+        # SMOOTH CONTOUR (VERY IMPORTANT)
+        # -------------------------------
+        epsilon = 0.01 * cv2.arcLength(largest, True)
+        approx = cv2.approxPolyDP(largest, epsilon, True)
 
-    # fallback → DO NOT DRAW BOX anymore
+        cv2.drawContours(roi, [approx], -1, (255,255,255), 2)
+
+    else:
+        # fallback: create pseudo-liver region (ellipse)
+        h, w = image.shape[:2]
+        center = (w//2, h//2)
+        axes = (w//4, h//5)
+
+        cv2.ellipse(roi, center, axes, 0, 0, 360, (255,255,255), 2)
+
     return roi
 
 # ===============================
