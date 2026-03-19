@@ -139,39 +139,34 @@ def create_segmentation_mask(mask):
     return clean
 
 # ===============================
-# HEATMAP (FINAL FIXED)
+# HEATMAP (FINAL FIX - NO SHAPES)
 # ===============================
 def create_heatmap(image, liver_mask, fat_mask):
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
-    # original heatmap
+    # Normalize image
     norm = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-    heatmap = cv2.applyColorMap(norm.astype(np.uint8), cv2.COLORMAP_JET)
 
-    result = heatmap.copy()
+    # Better colormap
+    heatmap = cv2.applyColorMap(norm.astype(np.uint8), cv2.COLORMAP_INFERNO)
 
-    # -------------------------------
-    # ADD FAT PATCH INSIDE ROI CENTER
-    # -------------------------------
-    coords = np.column_stack(np.where(liver_mask == 1))
+    # Create fat highlight layer
+    fat_highlight = np.zeros_like(heatmap, dtype=np.uint8)
 
-    if len(coords) > 0:
-        cy, cx = np.mean(coords, axis=0).astype(int)
+    # Highlight fat (bright yellow)
+    fat_highlight[fat_mask == 1] = [0, 255, 255]  # BGR
 
-        temp = result.copy()
+    # Blend heatmap + fat
+    result = cv2.addWeighted(heatmap, 0.7, fat_highlight, 0.9, 0)
 
-        axes = (20, 12)
-        angle = np.random.randint(0,180)
-
-        cv2.ellipse(temp, (cx, cy), axes, angle, 0, 360, (0,200,255), -1)
-
-        result = cv2.addWeighted(result, 0.75, temp, 0.25, 0)
+    # Keep background clean
+    result[liver_mask == 0] = heatmap[liver_mask == 0]
 
     return result
 
 # ===============================
-# HU (DIVIDED BY 2)
+# HU
 # ===============================
 def calculate_mean_hu(image, mask):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -197,7 +192,7 @@ def determine_stage(mean):
         return "Severe NAFLD"
 
 # ===============================
-# EXPLAINABLE AI (UNCHANGED)
+# EXPLAINABLE AI
 # ===============================
 def explain_all(diagnosis, stage, mean):
 
