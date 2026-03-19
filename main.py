@@ -99,24 +99,30 @@ def clean_fat_mask(mask, liver_mask, shape):
 # ===============================
 # ROI (UNCHANGED)
 # ===============================
+# ===============================
+# ROI (FIXED - NO SMALL BOX)
+# ===============================
 def create_roi(image, mask):
 
     roi = image.copy()
 
-    contours,_ = cv2.findContours(mask.astype(np.uint8),
-                                  cv2.RETR_EXTERNAL,
-                                  cv2.CHAIN_APPROX_SIMPLE)
+    mask = (mask > 0).astype(np.uint8)
+
+    # Fill holes → stronger mask
+    kernel = np.ones((15,15), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    contours,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     if contours:
         largest = max(contours, key=cv2.contourArea)
 
-        if cv2.contourArea(largest) > 500:
+        # draw ONLY if large enough
+        if cv2.contourArea(largest) > 2000:
             cv2.drawContours(roi, [largest], -1, (255,255,255), 2)
             return roi
 
-    h, w = image.shape[:2]
-    cv2.rectangle(roi, (w//3, h//3), (2*w//3, 2*h//3), (255,255,255), 2)
-
+    # fallback → DO NOT DRAW BOX anymore
     return roi
 
 # ===============================
@@ -139,29 +145,41 @@ def create_segmentation_mask(mask):
     return clean
 
 # ===============================
-# HEATMAP (FINAL FIX - NO SHAPES)
+# HEATMAP (FINAL PERFECT)
 # ===============================
 def create_heatmap(image, liver_mask, fat_mask):
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
-    # Normalize image
+    # Normalize
     norm = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
 
-    # Better colormap
-    heatmap = cv2.applyColorMap(norm.astype(np.uint8), cv2.COLORMAP_INFERNO)
+    # Use JET (your requirement)
+    heatmap = cv2.applyColorMap(norm.astype(np.uint8), cv2.COLORMAP_JET)
 
-    # Create fat highlight layer
-    fat_highlight = np.zeros_like(heatmap, dtype=np.uint8)
+    # -------------------------------
+    # STRONG FAT REGION CREATION
+    # -------------------------------
+    fat = (fat_mask > 0).astype(np.uint8)
 
-    # Highlight fat (bright yellow)
-    fat_highlight[fat_mask == 1] = [0, 255, 255]  # BGR
+    # expand fat → create patches
+    kernel = np.ones((9,9), np.uint8)
+    fat = cv2.dilate(fat, kernel, iterations=2)
 
-    # Blend heatmap + fat
-    result = cv2.addWeighted(heatmap, 0.7, fat_highlight, 0.9, 0)
+    # smooth → natural look
+    fat = cv2.GaussianBlur(fat.astype(np.float32), (11,11), 0)
+    fat = (fat > 0.15).astype(np.uint8)
 
-    # Keep background clean
-    result[liver_mask == 0] = heatmap[liver_mask == 0]
+    # restrict inside liver
+    fat = fat * liver_mask
+
+    # -------------------------------
+    # APPLY HIGHLIGHT
+    # -------------------------------
+    result = heatmap.copy()
+
+    # boost intensity → bright yellow spots
+    result[fat == 1] = [0, 255, 255]
 
     return result
 
