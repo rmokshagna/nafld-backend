@@ -94,54 +94,42 @@ def clean_fat_mask(mask, liver_mask, shape):
     return mask
 
 # ===============================
-# ROI (FINAL FIX - ROBUST & SMOOTH)
+# CLEAN LIVER MASK (FINAL)
+# ===============================
+def clean_liver_mask(mask, shape):
+
+    mask = (mask > 0.15).astype(np.uint8)
+    mask = cv2.resize(mask, (shape[1], shape[0]))
+
+    # LIGHT cleaning only (no distortion)
+    kernel = np.ones((5,5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    # -------------------------------
+    # If mask too small → expand slightly
+    # -------------------------------
+    if np.sum(mask) < 1000:
+        kernel = np.ones((15,15), np.uint8)
+        mask = cv2.dilate(mask, kernel, iterations=1)
+
+    return mask
+# ===============================
+# ROI (MATCH SEGMENTATION EXACTLY)
 # ===============================
 def create_roi(image, mask):
 
     roi = image.copy()
     mask = (mask > 0).astype(np.uint8)
 
-    h, w = mask.shape
-
-    # -------------------------------
-    # STEP 1: STRONG MASK EXPANSION
-    # -------------------------------
-    kernel = np.ones((35,35), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask = cv2.dilate(mask, kernel, iterations=2)
-
-    # -------------------------------
-    # STEP 2: SMOOTH MASK (REMOVE BLOCKS)
-    # -------------------------------
-    mask = cv2.GaussianBlur(mask.astype(np.float32), (31,31), 0)
-    mask = (mask > 0.3).astype(np.uint8)
-
-    # -------------------------------
-    # STEP 3: ENSURE MINIMUM LIVER AREA
-    # -------------------------------
-    if np.sum(mask) < 0.08 * (h * w):
-        # create liver-like shape (NOT box)
-        mask = np.zeros_like(mask)
-        center = (w//2, h//2)
-        axes = (int(w*0.35), int(h*0.25))
-        cv2.ellipse(mask, center, axes, 0, 0, 360, 1, -1)
-
-    # -------------------------------
-    # STEP 4: EXTRACT CONTOUR
-    # -------------------------------
     contours,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     if contours:
         largest = max(contours, key=cv2.contourArea)
 
-        # smooth contour edges
-        epsilon = 0.02 * cv2.arcLength(largest, True)
-        smooth = cv2.approxPolyDP(largest, epsilon, True)
-
-        cv2.drawContours(roi, [smooth], -1, (255,255,255), 2)
+        # preserve real shape (no polygon distortion)
+        cv2.drawContours(roi, [largest], -1, (255,255,255), 2)
 
     return roi
-
 # ===============================
 # SEGMENTATION
 # ===============================
