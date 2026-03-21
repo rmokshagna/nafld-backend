@@ -66,7 +66,6 @@ def encode(img):
 # CLEAN LIVER MASK
 # ===============================
 def clean_liver_mask(mask, shape):
-
     mask = (mask > 0.15).astype(np.uint8)
     mask = cv2.resize(mask, (shape[1], shape[0]))
 
@@ -89,59 +88,42 @@ def clean_liver_mask(mask, shape):
 # CLEAN FAT MASK
 # ===============================
 def clean_fat_mask(mask, liver_mask, shape):
-
     mask = (mask > 0.5).astype(np.uint8)
     mask = cv2.resize(mask, (shape[1], shape[0]))
     mask = mask * liver_mask
-
     return mask
 
 # ===============================
-# ROI (FORCED FULL LIVER CONTOUR)
+# ROI (UNCHANGED)
 # ===============================
 def create_roi(image, mask):
 
     roi = image.copy()
     mask = (mask > 0).astype(np.uint8)
 
-    # -------------------------------
-    # STRONG MASK REFINEMENT
-    # -------------------------------
     kernel = np.ones((25,25), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel)
 
-    # Fill holes
     mask = cv2.medianBlur(mask, 11)
 
     contours,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     if contours:
         largest = max(contours, key=cv2.contourArea)
-
-        # -------------------------------
-        # SMOOTH CONTOUR (VERY IMPORTANT)
-        # -------------------------------
         epsilon = 0.01 * cv2.arcLength(largest, True)
         approx = cv2.approxPolyDP(largest, epsilon, True)
-
         cv2.drawContours(roi, [approx], -1, (255,255,255), 2)
-
     else:
-        # fallback: create pseudo-liver region (ellipse)
         h, w = image.shape[:2]
-        center = (w//2, h//2)
-        axes = (w//4, h//5)
-
-        cv2.ellipse(roi, center, axes, 0, 0, 360, (255,255,255), 2)
+        cv2.ellipse(roi, (w//2, h//2), (w//4, h//5), 0, 0, 360, (255,255,255), 2)
 
     return roi
 
 # ===============================
-# SEGMENTATION (UNCHANGED)
+# SEGMENTATION
 # ===============================
 def create_segmentation_mask(mask):
-
     seg = (mask * 255).astype(np.uint8)
 
     contours,_ = cv2.findContours(seg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -150,53 +132,46 @@ def create_segmentation_mask(mask):
 
     if contours:
         largest = max(contours, key=cv2.contourArea)
-
         if cv2.contourArea(largest) > 500:
             cv2.drawContours(clean, [largest], -1, 255, -1)
 
     return clean
 
 # ===============================
-# HEATMAP (FINAL PERFECT)
+# HEATMAP (FINAL)
 # ===============================
-def create_heatmap(image, liver_mask, fat_mask):
+def create_heatmap(image, liver_mask, fat_mask, stage):
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
-
-    # Normalize
     norm = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
 
-    # Use JET (your requirement)
-    heatmap = cv2.applyColorMap(norm.astype(np.uint8), cv2.COLORMAP_JET)
+    heatmap = cv2.applyColorMap(norm.astype(np.uint8), cv2.COLORMAP_INFERNO)
 
-    # -------------------------------
-    # STRONG FAT REGION CREATION
-    # -------------------------------
     fat = (fat_mask > 0).astype(np.uint8)
 
-    # expand fat → create patches
-    kernel = np.ones((9,9), np.uint8)
-    fat = cv2.dilate(fat, kernel, iterations=2)
+    if stage == "Mild NAFLD":
+        kernel = np.ones((5,5), np.uint8)
+        fat = cv2.dilate(fat, kernel, 1)
 
-    # smooth → natural look
+    elif stage == "Moderate NAFLD":
+        kernel = np.ones((9,9), np.uint8)
+        fat = cv2.dilate(fat, kernel, 2)
+
+    else:
+        kernel = np.ones((15,15), np.uint8)
+        fat = cv2.dilate(fat, kernel, 3)
+
     fat = cv2.GaussianBlur(fat.astype(np.float32), (11,11), 0)
-    fat = (fat > 0.15).astype(np.uint8)
-
-    # restrict inside liver
+    fat = (fat > 0.2).astype(np.uint8)
     fat = fat * liver_mask
 
-    # -------------------------------
-    # APPLY HIGHLIGHT
-    # -------------------------------
     result = heatmap.copy()
-
-    # boost intensity → bright yellow spots
-    result[fat == 1] = [0, 255, 255]
+    result[fat == 1] = [0,255,255]
 
     return result
 
 # ===============================
-# HU
+# HU (UNCHANGED)
 # ===============================
 def calculate_mean_hu(image, mask):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -208,18 +183,43 @@ def calculate_mean_hu(image, mask):
     return float(np.mean(pixels) / 2)
 
 # ===============================
-# STAGE
+# STAGE (UPDATED)
 # ===============================
 def determine_stage(mean):
 
-    if mean > 55:
-        return "Normal Liver"
-    elif 45 <= mean <= 55:
+    if mean > 50:
         return "Mild NAFLD"
-    elif 35 <= mean < 45:
+    elif 35 <= mean <= 50:
         return "Moderate NAFLD"
     else:
         return "Severe NAFLD"
+
+# ===============================
+# FAT %
+# ===============================
+def calculate_fat_percentage(liver_mask, fat_mask):
+    liver_pixels = np.sum(liver_mask == 1)
+    fat_pixels = np.sum((fat_mask == 1) & (liver_mask == 1))
+
+    if liver_pixels == 0:
+        return 0
+
+    return float((fat_pixels / liver_pixels) * 100)
+
+# ===============================
+# SEVERITY SCORE
+# ===============================
+def calculate_severity_score(stage, fat_percent):
+
+    if stage == "Mild NAFLD":
+        base = 30
+    elif stage == "Moderate NAFLD":
+        base = 60
+    else:
+        base = 85
+
+    score = base + (fat_percent * 0.2)
+    return min(round(score,2), 100)
 
 # ===============================
 # EXPLAINABLE AI
@@ -227,39 +227,9 @@ def determine_stage(mean):
 def explain_all(diagnosis, stage, mean):
 
     if diagnosis == "Healthy Liver":
+        return "Healthy liver", ["None"], ["Maintain lifestyle"]
 
-        explain = (
-            f"The CT scan was analyzed and the liver region was segmented. "
-            f"The mean intensity value is {round(mean,2)}, which lies in the normal range. "
-            "No fat accumulation detected, indicating a healthy liver."
-        )
-
-        symptoms = ["No major symptoms", "Normal liver function"]
-
-        remedies = ["Healthy diet", "Regular exercise", "Routine checkups"]
-
-    else:
-
-        explain = (
-            f"The liver region was segmented using a deep learning U-Net model. "
-            f"Fat accumulation was identified based on pixel intensity variations. "
-            f"The mean HU value is {round(mean,2)}, corresponding to {stage}. "
-        )
-
-        symptoms = [
-            "Fatigue",
-            "Abdominal discomfort",
-            "Weight gain"
-        ]
-
-        remedies = [
-            "Reduce fat intake",
-            "Exercise",
-            "Avoid alcohol",
-            "Consult doctor"
-        ]
-
-    return explain, symptoms, remedies
+    return f"Mean HU {round(mean,2)} → {stage}", ["Fatigue","Pain"], ["Diet","Exercise"]
 
 # ===============================
 # API
@@ -271,45 +241,38 @@ async def predict(file: UploadFile = File(...)):
     image = np.array(Image.open(io.BytesIO(contents)).convert("RGB"))
     image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
-    # CNN
     cnn_img = preprocess_cnn(image)
     cnn_interpreter.set_tensor(cnn_input[0]['index'], cnn_img)
     cnn_interpreter.invoke()
     prob = float(cnn_interpreter.get_tensor(cnn_output[0]['index'])[0][0])
 
     if prob < 0.5:
-        exp, sym, rem = explain_all("Healthy Liver", "Normal Liver", 0)
+        return {"Diagnosis":"Healthy Liver","Probability":prob}
 
-        return {
-            "Diagnosis":"Healthy Liver",
-            "Probability":prob,
-            "Status":"Success",
-            "Explainable_AI":exp,
-            "Symptoms":sym,
-            "Remedies":rem
-        }
-
-    # LIVER
     liver_img = preprocess_unet(image,256)
     liver_interpreter.set_tensor(liver_input[0]['index'], liver_img)
     liver_interpreter.invoke()
     liver_mask = liver_interpreter.get_tensor(liver_output[0]['index'])[0,:,:,0]
     liver_mask = clean_liver_mask(liver_mask,image.shape)
 
-    # FAT
     fat_img = preprocess_unet(image,128)
     fat_interpreter.set_tensor(fat_input[0]['index'], fat_img)
     fat_interpreter.invoke()
     fat_mask = fat_interpreter.get_tensor(fat_output[0]['index'])[0,:,:,0]
     fat_mask = clean_fat_mask(fat_mask,liver_mask,image.shape)
 
-    # OUTPUTS
-    roi = create_roi(image,liver_mask)
-    heatmap = create_heatmap(image,liver_mask,fat_mask)
-    seg = create_segmentation_mask(liver_mask)
-
     mean = calculate_mean_hu(image,liver_mask)
     stage = determine_stage(mean)
+
+    if prob >= 0.5 and mean > 50:
+        stage = "Mild NAFLD"
+
+    fat_percent = calculate_fat_percentage(liver_mask, fat_mask)
+    severity_score = calculate_severity_score(stage, fat_percent)
+
+    roi = create_roi(image,liver_mask)
+    heatmap = create_heatmap(image,liver_mask,fat_mask,stage)
+    seg = create_segmentation_mask(liver_mask)
 
     exp, sym, rem = explain_all("NAFLD", stage, mean)
 
@@ -318,6 +281,8 @@ async def predict(file: UploadFile = File(...)):
         "Probability":prob,
         "Mean_HU":round(mean,2),
         "Stage":stage,
+        "Fat_Percentage":round(fat_percent,2),
+        "Severity_Score":severity_score,
         "ROI_Image":encode(roi),
         "Heatmap_Image":encode(heatmap),
         "Segmentation_Mask":encode(seg),
