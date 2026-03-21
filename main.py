@@ -132,42 +132,41 @@ def clean_liver_mask(mask, shape):
 
     return mask
 # ===============================
-# ROI (PERFECT FULL LIVER)
+# ROI (EXACT COPY OF SEGMENTATION)
 # ===============================
 def create_roi(image, mask):
 
     roi = image.copy()
+
+    # ensure binary
     mask = (mask > 0).astype(np.uint8)
 
-    contours,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # find contour directly from segmentation
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     if contours:
         largest = max(contours, key=cv2.contourArea)
 
-        # smooth contour (no polygon edges)
-        smooth = cv2.GaussianBlur(mask.astype(np.float32), (9,9), 0)
-        smooth = (smooth > 0.3).astype(np.uint8)
-
-        contours,_ = cv2.findContours(smooth, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        largest = max(contours, key=cv2.contourArea)
-
+        # IMPORTANT: no smoothing, no approx, no modification
         cv2.drawContours(roi, [largest], -1, (255,255,255), 2)
 
     return roi
 # ===============================
-# SEGMENTATION MASK (FULL LIVER)
+# SEGMENTATION
 # ===============================
 def create_segmentation_mask(mask):
+    seg = (mask * 255).astype(np.uint8)
 
-    mask = (mask > 0).astype(np.uint8)
+    contours,_ = cv2.findContours(seg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    kernel = np.ones((15,15), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    clean = np.zeros_like(seg)
 
-    mask = cv2.GaussianBlur(mask.astype(np.float32), (11,11), 0)
-    mask = (mask > 0.3).astype(np.uint8)
+    if contours:
+        largest = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(largest) > 500:
+            cv2.drawContours(clean, [largest], -1, 255, -1)
 
-    return (mask * 255).astype(np.uint8)
+    return clean
 
 # ===============================
 # HEATMAP (FINAL PERFECT)
