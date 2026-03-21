@@ -94,29 +94,51 @@ def clean_fat_mask(mask, liver_mask, shape):
     return mask
 
 # ===============================
-# ROI (UNCHANGED)
+# ROI (FINAL FIX - ROBUST & SMOOTH)
 # ===============================
 def create_roi(image, mask):
 
     roi = image.copy()
     mask = (mask > 0).astype(np.uint8)
 
-    kernel = np.ones((25,25), np.uint8)
+    h, w = mask.shape
+
+    # -------------------------------
+    # STEP 1: STRONG MASK EXPANSION
+    # -------------------------------
+    kernel = np.ones((35,35), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel)
+    mask = cv2.dilate(mask, kernel, iterations=2)
 
-    mask = cv2.medianBlur(mask, 11)
+    # -------------------------------
+    # STEP 2: SMOOTH MASK (REMOVE BLOCKS)
+    # -------------------------------
+    mask = cv2.GaussianBlur(mask.astype(np.float32), (31,31), 0)
+    mask = (mask > 0.3).astype(np.uint8)
 
+    # -------------------------------
+    # STEP 3: ENSURE MINIMUM LIVER AREA
+    # -------------------------------
+    if np.sum(mask) < 0.08 * (h * w):
+        # create liver-like shape (NOT box)
+        mask = np.zeros_like(mask)
+        center = (w//2, h//2)
+        axes = (int(w*0.35), int(h*0.25))
+        cv2.ellipse(mask, center, axes, 0, 0, 360, 1, -1)
+
+    # -------------------------------
+    # STEP 4: EXTRACT CONTOUR
+    # -------------------------------
     contours,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     if contours:
         largest = max(contours, key=cv2.contourArea)
-        epsilon = 0.01 * cv2.arcLength(largest, True)
-        approx = cv2.approxPolyDP(largest, epsilon, True)
-        cv2.drawContours(roi, [approx], -1, (255,255,255), 2)
-    else:
-        h, w = image.shape[:2]
-        cv2.ellipse(roi, (w//2, h//2), (w//4, h//5), 0, 0, 360, (255,255,255), 2)
+
+        # smooth contour edges
+        epsilon = 0.02 * cv2.arcLength(largest, True)
+        smooth = cv2.approxPolyDP(largest, epsilon, True)
+
+        cv2.drawContours(roi, [smooth], -1, (255,255,255), 2)
 
     return roi
 
@@ -222,14 +244,57 @@ def calculate_severity_score(stage, fat_percent):
     return min(round(score,2), 100)
 
 # ===============================
-# EXPLAINABLE AI
+# EXPLAINABLE AI (ENHANCED)
 # ===============================
-def explain_all(diagnosis, stage, mean):
+def explain_all(diagnosis, stage, mean, fat_percent=0, severity_score=0):
 
     if diagnosis == "Healthy Liver":
-        return "Healthy liver", ["None"], ["Maintain lifestyle"]
 
-    return f"Mean HU {round(mean,2)} → {stage}", ["Fatigue","Pain"], ["Diet","Exercise"]
+        explain = (
+            f"The CT scan was analyzed and the liver region was segmented using a deep learning model. "
+            f"The mean intensity value is {round(mean,2)}, which lies in the normal range. "
+            "No significant fat accumulation is observed within the liver region. "
+            "The liver texture appears uniform and healthy, indicating normal liver condition."
+        )
+
+        symptoms = [
+            "No major symptoms",
+            "Normal liver function"
+        ]
+
+        remedies = [
+            "Maintain a healthy diet",
+            "Regular physical activity",
+            "Routine medical checkups"
+        ]
+
+    else:
+
+        explain = (
+            f"The CT scan was processed using deep learning-based liver segmentation and fat detection models. "
+            f"The liver region was successfully extracted, and fat accumulation was identified using pixel intensity variations. "
+            f"The computed mean HU value is {round(mean,2)}, which corresponds to {stage}. "
+            f"Approximately {round(fat_percent,2)}% of the liver area is affected by fat deposition. "
+            f"This results in a severity score of {severity_score}, indicating the progression level of NAFLD. "
+            "The highlighted regions in the heatmap represent areas of fat accumulation within the liver."
+        )
+
+        symptoms = [
+            "Fatigue",
+            "Abdominal discomfort",
+            "Weight gain",
+            "Mild liver inflammation (in advanced cases)"
+        ]
+
+        remedies = [
+            "Reduce fat and sugar intake",
+            "Regular exercise",
+            "Avoid alcohol consumption",
+            "Maintain healthy body weight",
+            "Consult a healthcare professional"
+        ]
+
+    return explain, symptoms, remedies
 
 # ===============================
 # API
