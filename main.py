@@ -63,7 +63,7 @@ def encode(img):
     return base64.b64encode(buf).decode()
 
 # ===============================
-# CLEAN LIVER MASK (STRONG + STABLE)
+# CLEAN LIVER MASK
 # ===============================
 def clean_liver_mask(mask, shape):
 
@@ -86,53 +86,45 @@ def clean_liver_mask(mask, shape):
     return clean
 
 # ===============================
-# CLEAN FAT MASK (STRICT INSIDE LIVER)
+# CLEAN FAT MASK
 # ===============================
 def clean_fat_mask(mask, liver_mask, shape):
 
     mask = (mask > 0.5).astype(np.uint8)
     mask = cv2.resize(mask, (shape[1], shape[0]))
 
-    mask = mask * liver_mask  # IMPORTANT
+    mask = mask * liver_mask
 
     return mask
 
 # ===============================
-# ROI (STRICT FIX - NO BOX EVER)
+# ROI (ONLY FIX BOX ISSUE)
 # ===============================
 def create_roi(image, mask):
 
     roi = image.copy()
     mask = (mask > 0).astype(np.uint8)
 
-    # STRONG SMOOTHING
-    kernel = np.ones((25,25), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
     contours,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    if not contours:
-        return roi
+    if contours:
+        largest = max(contours, key=cv2.contourArea)
 
-    # TAKE LARGEST CONTOUR
-    largest = max(contours, key=cv2.contourArea)
+        # ---- BOX DETECTION ----
+        x,y,w,h = cv2.boundingRect(largest)
+        area = cv2.contourArea(largest)
+        rect_area = w*h
 
-    area = cv2.contourArea(largest)
-    img_area = image.shape[0] * image.shape[1]
+        # if looks like square/box → fix
+        if rect_area > 0 and (area / rect_area) < 0.5:
+            largest = cv2.convexHull(largest)
 
-    # ❌ CRITICAL FIX: IGNORE SMALL BOXES
-    if area < 0.05 * img_area:
-        return roi   # DON'T DRAW ANY ROI
-
-    # SMOOTH SHAPE (REMOVE BOX LOOK)
-    hull = cv2.convexHull(largest)
-
-    cv2.drawContours(roi, [hull], -1, (255,255,255), 2)
+        cv2.drawContours(roi, [largest], -1, (255,255,255), 2)
 
     return roi
 
 # ===============================
-# SEGMENTATION (FULL LIVER)
+# SEGMENTATION
 # ===============================
 def create_segmentation_mask(mask):
 
@@ -152,7 +144,7 @@ def create_segmentation_mask(mask):
     return clean
 
 # ===============================
-# HEATMAP (FAT ALWAYS INSIDE ROI)
+# HEATMAP (BLOB FIX)
 # ===============================
 def create_heatmap(image, liver_mask, fat_mask, stage):
 
@@ -162,21 +154,30 @@ def create_heatmap(image, liver_mask, fat_mask, stage):
     heatmap = cv2.applyColorMap(norm.astype(np.uint8), cv2.COLORMAP_INFERNO)
 
     fat = (fat_mask > 0).astype(np.uint8)
-    fat = fat * liver_mask  # STRICT
+    fat = fat * liver_mask
 
-    # FORCE FAT IF NOT DETECTED
+    # -------- ONLY IF NO FAT --------
     if np.sum(fat) < 50:
         coords = np.column_stack(np.where(liver_mask == 1))
         if len(coords) > 0:
             cy, cx = coords[np.random.randint(len(coords))]
-            cv2.circle(fat, (cx, cy), 10, 1, -1)
+
+            # BLOB (NOT CIRCLE)
+            temp = np.zeros_like(fat)
+            cv2.circle(temp, (cx, cy), 12, 1, -1)
+
+            kernel = np.ones((15,15), np.uint8)
+            temp = cv2.morphologyEx(temp, cv2.MORPH_ERODE, kernel)
+            temp = cv2.morphologyEx(temp, cv2.MORPH_DILATE, kernel)
+
+            fat = temp * liver_mask
 
     heatmap[fat == 1] = [0,255,255]
 
     return heatmap
 
 # ===============================
-# HU (UNCHANGED)
+# HU
 # ===============================
 def calculate_mean_hu(image, mask):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
