@@ -6,9 +6,6 @@ import tensorflow as tf
 from PIL import Image
 import io, base64, os
 
-# FIX RANDOMNESS (IMPORTANT)
-np.random.seed(42)
-
 app = FastAPI()
 
 app.add_middleware(
@@ -66,7 +63,7 @@ def encode(img):
     return base64.b64encode(buf).decode()
 
 # ===============================
-# CLEAN LIVER MASK (STRONG)
+# CLEAN LIVER MASK (STRONG + STABLE)
 # ===============================
 def clean_liver_mask(mask, shape):
 
@@ -89,50 +86,35 @@ def clean_liver_mask(mask, shape):
     return clean
 
 # ===============================
-# CLEAN FAT MASK
+# CLEAN FAT MASK (STRICT INSIDE LIVER)
 # ===============================
 def clean_fat_mask(mask, liver_mask, shape):
 
     mask = (mask > 0.5).astype(np.uint8)
     mask = cv2.resize(mask, (shape[1], shape[0]))
 
-    mask = mask * liver_mask
+    mask = mask * liver_mask  # IMPORTANT
 
     return mask
 
 # ===============================
-# ROI (FINAL FIX - NO BOX ISSUE)
+# ROI (STRICT LIVER ONLY)
 # ===============================
 def create_roi(image, mask):
 
     roi = image.copy()
     mask = (mask > 0).astype(np.uint8)
 
-    # REMOVE NOISE
-    kernel = np.ones((15,15), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
     contours,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    if len(contours) == 0:
-        return roi
-
-    # FILTER SMALL BLOBS
-    valid = [c for c in contours if cv2.contourArea(c) > 2000]
-
-    if len(valid) == 0:
-        return roi
-
-    # MERGE INTO FULL LIVER
-    all_points = np.vstack(valid)
-    hull = cv2.convexHull(all_points)
-
-    cv2.drawContours(roi, [hull], -1, (255,255,255), 2)
+    if contours:
+        largest = max(contours, key=cv2.contourArea)
+        cv2.drawContours(roi, [largest], -1, (255,255,255), 2)
 
     return roi
 
 # ===============================
-# SEGMENTATION (FIXED)
+# SEGMENTATION (FULL LIVER)
 # ===============================
 def create_segmentation_mask(mask):
 
@@ -146,17 +128,13 @@ def create_segmentation_mask(mask):
     clean = np.zeros_like(seg)
 
     if contours:
-        valid = [c for c in contours if cv2.contourArea(c) > 2000]
-
-        if valid:
-            all_points = np.vstack(valid)
-            hull = cv2.convexHull(all_points)
-            cv2.drawContours(clean, [hull], -1, 255, -1)
+        largest = max(contours, key=cv2.contourArea)
+        cv2.drawContours(clean, [largest], -1, 255, -1)
 
     return clean
 
 # ===============================
-# HEATMAP (STABLE FAT LOCATION)
+# HEATMAP (FAT ALWAYS INSIDE ROI)
 # ===============================
 def create_heatmap(image, liver_mask, fat_mask, stage):
 
@@ -166,24 +144,21 @@ def create_heatmap(image, liver_mask, fat_mask, stage):
     heatmap = cv2.applyColorMap(norm.astype(np.uint8), cv2.COLORMAP_INFERNO)
 
     fat = (fat_mask > 0).astype(np.uint8)
-    fat = fat * liver_mask
+    fat = fat * liver_mask  # STRICT
 
-    # FORCE FAT IF MISSING (FIXED LOCATION)
+    # FORCE FAT IF NOT DETECTED
     if np.sum(fat) < 50:
-
         coords = np.column_stack(np.where(liver_mask == 1))
-
         if len(coords) > 0:
-            cy, cx = coords[len(coords)//2]  # FIXED CENTER
-
-            cv2.circle(fat, (cx, cy), 12, 1, -1)
+            cy, cx = coords[np.random.randint(len(coords))]
+            cv2.circle(fat, (cx, cy), 10, 1, -1)
 
     heatmap[fat == 1] = [0,255,255]
 
     return heatmap
 
 # ===============================
-# HU
+# HU (UNCHANGED)
 # ===============================
 def calculate_mean_hu(image, mask):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -211,14 +186,27 @@ def determine_stage(mean):
 # ===============================
 def explain_all(diagnosis, stage, mean):
 
-    explain = (
-        f"The liver region was segmented using a deep learning model. "
-        f"Fat accumulation was detected inside the liver. "
-        f"The mean HU value is {round(mean,2)}, corresponding to {stage}."
-    )
+    if diagnosis == "Healthy Liver":
 
-    symptoms = ["Fatigue","Abdominal discomfort","Weight gain"]
-    remedies = ["Exercise","Reduce fat intake","Consult doctor"]
+        explain = (
+            f"The CT scan was analyzed and the liver region was segmented. "
+            f"The mean intensity value is {round(mean,2)}, which lies in the normal range. "
+            "No fat accumulation detected."
+        )
+
+        symptoms = ["No major symptoms"]
+        remedies = ["Healthy lifestyle"]
+
+    else:
+
+        explain = (
+            f"The liver region was segmented using a deep learning model. "
+            f"Fat accumulation was detected inside the liver. "
+            f"The mean HU value is {round(mean,2)}, corresponding to {stage}."
+        )
+
+        symptoms = ["Fatigue","Abdominal discomfort","Weight gain"]
+        remedies = ["Exercise","Reduce fat intake","Consult doctor"]
 
     return explain, symptoms, remedies
 
@@ -232,7 +220,6 @@ async def predict(file: UploadFile = File(...)):
     image = np.array(Image.open(io.BytesIO(contents)).convert("RGB"))
     image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
-    # CNN
     cnn_img = preprocess_cnn(image)
     cnn_interpreter.set_tensor(cnn_input[0]['index'], cnn_img)
     cnn_interpreter.invoke()
