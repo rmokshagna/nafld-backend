@@ -98,18 +98,36 @@ def clean_fat_mask(mask, liver_mask, shape):
     return mask
 
 # ===============================
-# ROI (STRICT LIVER ONLY)
+# ROI (STRICT FIX - NO BOX EVER)
 # ===============================
 def create_roi(image, mask):
 
     roi = image.copy()
     mask = (mask > 0).astype(np.uint8)
 
+    # STRONG SMOOTHING
+    kernel = np.ones((25,25), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
     contours,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    if contours:
-        largest = max(contours, key=cv2.contourArea)
-        cv2.drawContours(roi, [largest], -1, (255,255,255), 2)
+    if not contours:
+        return roi
+
+    # TAKE LARGEST CONTOUR
+    largest = max(contours, key=cv2.contourArea)
+
+    area = cv2.contourArea(largest)
+    img_area = image.shape[0] * image.shape[1]
+
+    # ❌ CRITICAL FIX: IGNORE SMALL BOXES
+    if area < 0.05 * img_area:
+        return roi   # DON'T DRAW ANY ROI
+
+    # SMOOTH SHAPE (REMOVE BOX LOOK)
+    hull = cv2.convexHull(largest)
+
+    cv2.drawContours(roi, [hull], -1, (255,255,255), 2)
 
     return roi
 
